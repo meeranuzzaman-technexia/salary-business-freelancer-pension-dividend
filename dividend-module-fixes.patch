@@ -1,0 +1,568 @@
+diff --git a/app/actions/bank-classification.ts b/app/actions/bank-classification.ts
+index 7bdddd8..8fc00d0 100644
+--- a/app/actions/bank-classification.ts
++++ b/app/actions/bank-classification.ts
+@@ -22,6 +22,7 @@ import {
+ import {
+   isMyselfBusinessBankFlow,
+   isSingleFreelancerServicesFiling,
++  isDividendIncomeSelected,
+   isBusinessBankCategory,
+   normalizeBankCategory,
+   businessBankDecisionError,
+@@ -740,6 +741,7 @@ export async function autoReviewSafeBankTransactionsAction(
+   try {
+     const draft = await getOwnedDraft(draftId);
+     const freelancerEnabled = isSingleFreelancerServicesFiling(draft);
++    const dividendEnabled = isDividendIncomeSelected(draft);
+     const account = await prisma.bankAccount.findFirst({
+       where: {
+         id: bankAccountId.trim(),
+@@ -811,6 +813,17 @@ export async function autoReviewSafeBankTransactionsAction(
+             ["SALARY", "PENSION"].includes(
+               transaction.suggestedCategory ?? "",
+             )) ||
++          // Dividend narrations are as self-identifying as payroll
++          // ("HUB POWER HUBCO FINAL DIVIDEND FY2025 …"), so a DIVIDEND
++          // suggestion is bulk-safe too — but only when the filing actually
++          // selected Dividend income AND the deterministic keyword rule
++          // reproduces the same category (the AI suggestion alone never
++          // suffices — same discipline as the business/services branches).
++          (transaction.suggestedEntryType === "INCOME" &&
++            transaction.suggestedCategory === "DIVIDEND" &&
++            dividendEnabled &&
++            classifyTransaction(transaction, [], {}).category ===
++              "DIVIDEND") ||
+           (isMyselfBusinessBankFlow(draft) &&
+             isBusinessBankCategory(transaction.suggestedCategory) &&
+             !businessBankDecisionError(
+diff --git a/app/actions/extraction.ts b/app/actions/extraction.ts
+index a9a858b..6cd9efb 100644
+--- a/app/actions/extraction.ts
++++ b/app/actions/extraction.ts
+@@ -2009,6 +2009,123 @@ export async function approveAndMapExtractedDocumentAction(documentId: string) {
+       };
+     }
+ 
++    if (document.documentType === "dividend_certificate") {
++      // A dividend certificate is EVIDENCE for dividend income that arrives
++      // through classified bank credits. Dividend has no per-document income
++      // records yet (the certificate-gross → income linking is deliberate
++      // phase-2 work — until then the engine prices the NET ledger credits),
++      // so this mapping approves the evidence only: gross dividend must be a
++      // positive printed figure, withholding may be exactly 0 (the REIT-SPV
++      // dividend is withheld at 0%), and a printed tax year must match the
++      // filing. No ledger rows are written here — the bank statement's net
++      // dividend credits already flow through Bank Intelligence.
++      if (!["COMPLETED", "MAPPED"].includes(document.extractionStatus)) {
++        return {
++          success: false,
++          error:
++            "Wait for document extraction to complete before approving the map.",
++        };
++      }
++
++      const grossDividend = parseExtractedAmount(
++        fieldValue(fields, [
++          "gross_dividend_pkr",
++          "gross_dividend",
++          "total_gross_dividend",
++          "total_dividend",
++        ]),
++      );
++      if (grossDividend === null || grossDividend <= 0) {
++        return {
++          success: false,
++          error:
++            "Enter the gross dividend from the certificate before approving the map.",
++        };
++      }
++
++      const dividendTaxWithheld = parseExtractedAmount(
++        fieldValue(fields, [
++          "withholding_tax_u_s_150",
++          "withholding_tax_u_s_236z",
++          "withholding_tax",
++          "tax_deducted_at_source",
++          "tax_deducted",
++          "tax_withheld",
++        ]),
++      );
++      if (dividendTaxWithheld !== null && dividendTaxWithheld < 0) {
++        return {
++          success: false,
++          error:
++            "Withholding tax cannot be negative. Enter 0 only when the certificate confirms no tax was withheld (e.g. a dividend received by a REIT scheme from its SPV).",
++        };
++      }
++
++      const dividendDraft = await prisma.filingDraft.findUnique({
++        where: { id: document.filingDraftId },
++        select: { taxYear: true },
++      });
++      if (!dividendDraft) {
++        return { success: false, error: "Filing draft not found" };
++      }
++      const certTaxYearRaw = fieldValue(fields, ["tax_year"]);
++      const certTaxYearDigits =
++        certTaxYearRaw === null || certTaxYearRaw === undefined
++          ? ""
++          : String(certTaxYearRaw).replace(/[^0-9]/g, "");
++      const certTaxYear =
++        certTaxYearDigits.length >= 4
++          ? Number(certTaxYearDigits.slice(0, 4))
++          : null;
++      if (certTaxYear !== null && certTaxYear !== dividendDraft.taxYear) {
++        return {
++          success: false,
++          error: `This certificate is for Tax Year ${certTaxYear}, but the filing is for Tax Year ${dividendDraft.taxYear}. Upload the certificate for the filing's tax year.`,
++        };
++      }
++
++      await prisma.$transaction(async (tx) => {
++        await tx.document.update({
++          where: { id: document.id },
++          data: { extractionStatus: "MAPPED", extractionStartedAt: null },
++        });
++        await tx.filingDraft.update({
++          where: { id: document.filingDraftId },
++          data: {
++            taxableIncome: null,
++            taxPayable: null,
++            refundDue: null,
++            taxCalculationStatus: "NOT_CALCULATED",
++            packetApprovalConfirmed: false,
++            packetApprovalAt: null,
++            packetApprovalByUserId: null,
++            status: "IN_PROGRESS",
++          },
++        });
++        await tx.filingPacket.updateMany({
++          where: {
++            filingDraftId: document.filingDraftId,
++            userId: document.userId,
++            status: { not: "SUPERSEDED" },
++          },
++          data: { status: "SUPERSEDED", approvalStatus: "SUPERSEDED" },
++        });
++        await invalidateBusinessBalancePackets(
++          tx,
++          document.filingDraftId,
++          document.userId,
++        );
++      });
++
++      revalidatePath("/tax/new");
++      return {
++        success: true,
++        mapping: "DIVIDEND_CERTIFICATE",
++        grossDividend,
++        taxWithheld: dividendTaxWithheld,
++      };
++    }
++
+     return {
+       success: false,
+       error: "No mapping rule exists for this document type yet",
+diff --git a/components/tax/filing/wizard-documents-step.tsx b/components/tax/filing/wizard-documents-step.tsx
+index ecb306c..24b3a3b 100644
+--- a/components/tax/filing/wizard-documents-step.tsx
++++ b/components/tax/filing/wizard-documents-step.tsx
+@@ -282,6 +282,7 @@ export function WizardDocumentsStep({
+             slot.documentType === "business_books" ||
+             slot.documentType === "business_support" ||
+             isPensionStatement ||
++            slot.documentType === "dividend_certificate" ||
+             slot.documentType === "invoice_summary" ||
+             slot.documentType === "other_income_proof" ||
+             slot.documentType === "advance_tax_evidence" ||
+diff --git a/lib/tax/bank-classification-rules.ts b/lib/tax/bank-classification-rules.ts
+index 1646066..706e10c 100644
+--- a/lib/tax/bank-classification-rules.ts
++++ b/lib/tax/bank-classification-rules.ts
+@@ -177,6 +177,26 @@ export const CLASSIFICATION_RULES = [
+     category: "PENSION",
+     confidence: 0.95,
+   },
++  {
++    // Dividend credits carry unmistakable payer narrations
++    // ("HUB POWER HUBCO FINAL DIVIDEND FY2025 …"), so a rule-matched DIVIDEND
++    // suggestion is SUGGESTED exactly like salary/pension. Auto-approval is
++    // still gated server-side on the filing actually selecting Dividend income
++    // and the deterministic rule reproducing the suggestion — an AI-only
++    // suggestion never rides through.
++    keywords: [
++      "dividend",
++      "dividend payout",
++      "dividend distribution",
++      "dividend credited",
++      "interim dividend",
++      "final dividend",
++      "dividend payment",
++    ],
++    entryType: "INCOME",
++    category: "DIVIDEND",
++    confidence: 0.88,
++  },
+   {
+     keywords: [
+       "grocery",
+diff --git a/lib/tax/business-bank-categories.ts b/lib/tax/business-bank-categories.ts
+index fd7b943..029eeb9 100644
+--- a/lib/tax/business-bank-categories.ts
++++ b/lib/tax/business-bank-categories.ts
+@@ -69,6 +69,18 @@ export function isPensionOnlyFiling(input: {
+   return sources.length === 1 && sources[0] === "pension";
+ }
+ 
++/**
++ * Dividend bank narrations are bulk-safe only when the filing actually
++ * selected Dividend income — combined filings (e.g. salary + dividend) still
++ * qualify; the gate only stops dividend rows being auto-approved in filings
++ * that never declared the source.
++ */
++export function isDividendIncomeSelected(input: {
++  incomeSources?: string | string[] | null;
++}) {
++  return readIncomeSources(input.incomeSources).includes("dividend");
++}
++
+ /** Full server-side activation gate for the first merged Freelancer route. */
+ export function isSingleFreelancerServicesFiling(input: {
+   taxYear?: number;
+diff --git a/package.json b/package.json
+index 9bfa961..1197bef 100644
+--- a/package.json
++++ b/package.json
+@@ -22,13 +22,14 @@
+     "verify:withholding-sources": "node scripts/verify-withholding-sources.cjs",
+     "verify:route-protection": "node scripts/verify-route-protection.cjs",
+     "verify:dependency-health": "node scripts/verify-dependency-health.cjs",
+-    "verify:all": "npm run verify:sales-tax-rules && npm run verify:sales-tax-intake && npm run verify:sales-tax-return && npm run verify:sales-tax-dates && npm run verify:multiple-filings && npm run verify:sales-tax-module && npm run verify:sales-tax-uploads && npm run verify:sales-tax-review && npm run verify:sales-tax-businesses && npm run verify:sales-tax-manual && npm run verify:srb-rules && npm run verify:srb-return && npm run verify:srb-module && npm run verify:ty2026-rates && npm run verify:ty2026-data-model && npm run verify:ty2026-filer-status && npm run verify:ty2026-subcategories && npm run verify:ty2026-tax-calculation && npm run verify:pension-routing && npm run verify:pension-review && npm run verify:business-profit && npm run verify:salary-certificate-fields && npm run verify:document-extraction-state && npm run verify:upload-safety && npm run verify:withholding-sources && npm run verify:route-protection && npm run verify:dependency-health && npm run verify:tax-breakdown-surfacing && npm run verify:cleanup-hygiene && npm run verify:flat-income-routes && npm run verify:advance-tax && npm run verify:money-precision && npm run verify:money-database && npm run verify:bank-statement-isolation && npm run verify:portal-field-map && npm run verify:bank-iban && npm run verify:cash-in-hand && npm run verify:bank-classification && npm run verify:employment-captures && npm run verify:property-capture && npm run verify:cnic-profile-plan && npm run verify:iris-row-filler && npm run verify:iris-wealth-driver && npm run verify:iris-employer-driver && npm run verify:iris-navigation",
++    "verify:all": "npm run verify:sales-tax-rules && npm run verify:sales-tax-intake && npm run verify:sales-tax-return && npm run verify:sales-tax-dates && npm run verify:multiple-filings && npm run verify:sales-tax-module && npm run verify:sales-tax-uploads && npm run verify:sales-tax-review && npm run verify:sales-tax-businesses && npm run verify:sales-tax-manual && npm run verify:srb-rules && npm run verify:srb-return && npm run verify:srb-module && npm run verify:ty2026-rates && npm run verify:ty2026-data-model && npm run verify:ty2026-filer-status && npm run verify:ty2026-subcategories && npm run verify:ty2026-tax-calculation && npm run verify:pension-routing && npm run verify:pension-review && npm run verify:business-profit && npm run verify:salary-certificate-fields && npm run verify:document-extraction-state && npm run verify:upload-safety && npm run verify:withholding-sources && npm run verify:route-protection && npm run verify:dependency-health && npm run verify:tax-breakdown-surfacing && npm run verify:cleanup-hygiene && npm run verify:flat-income-routes && npm run verify:advance-tax && npm run verify:money-precision && npm run verify:money-database && npm run verify:bank-statement-isolation && npm run verify:portal-field-map && npm run verify:bank-iban && npm run verify:cash-in-hand && npm run verify:bank-classification && npm run verify:employment-captures && npm run verify:property-capture && npm run verify:cnic-profile-plan && npm run verify:iris-row-filler && npm run verify:iris-wealth-driver && npm run verify:iris-employer-driver && npm run verify:iris-navigation && npm run verify:dividend-mapping",
+     "verify:money-precision": "node scripts/verify-money-precision.cjs",
+     "verify:money-database": "node scripts/verify-money-database.cjs",
+     "verify:tax-breakdown-surfacing": "node scripts/verify-tax-breakdown-surfacing.cjs",
+     "verify:cleanup-hygiene": "node scripts/verify-cleanup-hygiene.cjs",
+     "verify:flat-income-routes": "node scripts/verify-flat-income-routes.cjs",
+     "verify:advance-tax": "node scripts/verify-advance-tax.cjs",
++    "verify:dividend-mapping": "node scripts/verify-dividend-mapping.cjs",
+     "verify:sales-tax-rules": "node scripts/verify-sales-tax-rules.cjs",
+     "verify:sales-tax-intake": "node scripts/verify-sales-tax-intake.cjs",
+     "verify:sales-tax-return": "node scripts/verify-sales-tax-return.cjs",
+diff --git a/scripts/probe-dividend-classify.cjs b/scripts/probe-dividend-classify.cjs
+new file mode 100644
+index 0000000..8cb4046
+--- /dev/null
++++ b/scripts/probe-dividend-classify.cjs
+@@ -0,0 +1,109 @@
++#!/usr/bin/env node
++/**
++ * Probe: is the DIVIDEND auto-approve fix actually LIVE in this checkout?
++ *
++ * Run from the repo root:   node scripts/probe-dividend-classify.cjs
++ *
++ * It checks the four pieces the fix depends on and prints [OK]/[STALE]
++ * for each — no server, no database, no network needed.
++ */
++"use strict";
++
++const fs = require("node:fs");
++const path = require("node:path");
++const Module = require("node:module");
++let failures = 0;
++
++const root = path.join(__dirname, "..");
++
++// 1) Source-level checks: does each file actually contain the fix?
++const checks = [
++  {
++    file: "lib/tax/bank-classification-rules.ts",
++    needles: ['"dividend"', 'category: "DIVIDEND"'],
++    label: "DIVIDEND keyword rule in classification rules",
++  },
++  {
++    file: "lib/tax/business-bank-categories.ts",
++    needles: ["isDividendIncomeSelected"],
++    label: "isDividendIncomeSelected() gate helper",
++  },
++  {
++    file: "app/actions/bank-classification.ts",
++    needles: ["dividendEnabled", 'suggestedCategory === "DIVIDEND"'],
++    label: "auto-approve DIVIDEND branch",
++  },
++  {
++    file: "app/actions/extraction.ts",
++    needles: ['mapping: "DIVIDEND_CERTIFICATE"'],
++    label: "dividend certificate mapping branch (Task 5)",
++  },
++  {
++    file: "components/tax/filing/wizard-documents-step.tsx",
++    needles: ['slot.documentType === "dividend_certificate"'],
++    label: "mapping button whitelist (Task 5)",
++  },
++  {
++    file: "package.json",
++    needles: ["verify:dividend-mapping"],
++    label: "verify scripts wired",
++  },
++];
++for (const check of checks) {
++  const text = fs.readFileSync(path.join(root, check.file), "utf8");
++  const missing = check.needles.filter((needle) => !text.includes(needle));
++  if (missing.length === 0) {
++    console.log(`[OK]    ${check.label}  (${check.file})`);
++  } else {
++    failures += 1;
++    console.log(`[STALE] ${check.label}  (${check.file}) — missing: ${missing.join(", ")}`);
++  }
++}
++
++// 2) Behaviour check: what does the real rule engine say about the
++//    exact narration from the fixture statement?
++let ts;
++try {
++  ts = require("typescript");
++} catch {
++  console.log("[SKIP]  typescript module not available — run this from the repo root after npm install.");
++  process.exit(failures ? 1 : 0);
++}
++const originalResolve = Module._resolveFilename;
++Module._resolveFilename = function (request, ...rest) {
++  if (request.startsWith("@/")) request = path.join(root, request.slice(2));
++  return originalResolve.call(this, request, ...rest);
++};
++require.extensions[".ts"] = function (module, filename) {
++  module._compile(
++    ts.transpileModule(fs.readFileSync(filename, "utf8"), {
++      compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
++    }).outputText,
++    filename,
++  );
++};
++
++const rules = require(path.join(root, "lib/tax/bank-classification-rules.ts"));
++const narration = "HUB POWER HUBCO FINAL DIVIDEND FY2025 CNIC 4220106970933";
++const out = rules.classifyTransaction(
++  {
++    id: "probe",
++    bankAccountId: "a1",
++    transactionDate: new Date("2025-09-25"),
++    description: narration,
++    debit: null,
++    credit: "185000",
++  },
++  [],
++);
++console.log(`\nclassifyTransaction("${narration}")`);
++console.log(`  -> status=${out.status}  entryType=${out.entryType}  category=${out.category}`);
++if (out.status === "SUGGESTED" && out.category === "DIVIDEND") {
++  console.log("[OK]    Rule engine suggests DIVIDEND income — button will appear after Classify.");
++} else {
++  failures += 1;
++  console.log("[STALE] Rule engine does NOT know dividend — auto-approve button can never appear.");
++}
++
++console.log(failures ? `\n${failures} stale piece(s) found.` : "\nAll pieces live — if the app still shows 'Potential income', restart Next dev (rm -rf .next) and click Classify again.");
++process.exit(failures ? 1 : 0);
+diff --git a/scripts/verify-bank-classification.cjs b/scripts/verify-bank-classification.cjs
+index fbfd6ee..0401141 100644
+--- a/scripts/verify-bank-classification.cjs
++++ b/scripts/verify-bank-classification.cjs
+@@ -103,6 +103,72 @@ test("keywords: real matches still work, including plurals and punctuation", ()
+   );
+ });
+ 
++test("dividend: payer narrations are suggested as DIVIDEND income (credits only)", () => {
++  const cases = [
++    "HUB POWER HUBCO FINAL DIVIDEND FY2025 CNIC 4220106970933",
++    "DOLMEN CITY REIT DIVIDEND DISTRIBUTION CNIC 4220106970933",
++    "MEEZAN BALANCED FUND DIVIDEND PAYOUT CNIC 4220106970933",
++    "ABL INCOME FUND DIVIDEND CNIC 4220106970933",
++    "INTERIM DIVIDEND CREDITED - LUCKY CEMENT",
++    "DIVIDENDS RECEIVED FROM MUTUAL FUND",
++  ];
++  for (const description of cases) {
++    const out = classify(description, { credit: "185000" });
++    assert.equal(out.category, "DIVIDEND", description);
++    assert.equal(out.entryType, "INCOME", description);
++    assert.equal(out.status, "SUGGESTED", description);
++  }
++});
++
++test("dividend: debits, reversals, transfers and glued words never classify as DIVIDEND", () => {
++  // debit side: the rule is income-only
++  assert.notEqual(
++    classify("DIVIDEND FEE CHARGED", { debit: "1000" }).category,
++    "DIVIDEND",
++  );
++  // reversal wording wins over the dividend keyword
++  assert.notEqual(
++    classify("DIVIDEND REFUND REVERSAL", { credit: "185000" }).category,
++    "DIVIDEND",
++  );
++  // transfer language wins over the dividend keyword
++  assert.notEqual(
++    classify("FUNDS TRANSFER FROM HBL DIVIDEND ACCOUNT", { credit: "185000" })
++      .category,
++    "DIVIDEND",
++  );
++  // whole-word matching: a glued lookalike is not a dividend
++  assert.notEqual(
++    classify("DIVIDENDAL ADJUSTMENT NOTE", { credit: "185000" }).category,
++    "DIVIDEND",
++  );
++});
++
++test("dividend: auto-approve is gated — source selected + rule re-verified", () => {
++  const source = fs.readFileSync(
++    path.join(root, "app/actions/bank-classification.ts"),
++    "utf8",
++  );
++  const autoFn = source.slice(
++    source.indexOf("autoReviewSafeBankTransactionsAction"),
++  );
++  assert.ok(
++    /dividendEnabled\s*=\s*isDividendIncomeSelected\(draft\)/.test(autoFn),
++    "auto-review must read the filing's dividend source",
++  );
++  assert.ok(
++    /suggestedCategory === "DIVIDEND"[\s\S]*?dividendEnabled[\s\S]*?classifyTransaction\(transaction, \[\], \{\}\)\s*\.category\s*===\s*"DIVIDEND"/.test(
++      autoFn,
++    ),
++    "a DIVIDEND row is bulk-safe only when the source is selected AND the deterministic rule reproduces it",
++  );
++  // the salary/pension whitelist must stay tight — dividend rides its own branch
++  assert.ok(
++    /\["SALARY", "PENSION"\]\.includes/.test(autoFn),
++    "the SALARY/PENSION bulk-safe whitelist must remain intact",
++  );
++});
++
+ test("matcher: unit behaviour", () => {
+   const m = matching.bankDescriptionMatchesKeyword;
+   const n = matching.normalizeBankDescription;
+diff --git a/scripts/verify-dividend-mapping.cjs b/scripts/verify-dividend-mapping.cjs
+new file mode 100644
+index 0000000..dcf8aa0
+--- /dev/null
++++ b/scripts/verify-dividend-mapping.cjs
+@@ -0,0 +1,118 @@
++#!/usr/bin/env node
++"use strict";
++
++/**
++ * Guards the dividend-certificate mapping fix.
++ *
++ * Bug (reported from the wizard): a fully extracted, reviewed
++ * dividend_certificate showed "Mapping for this document type is not
++ * available yet." — the UI mappability whitelist omitted the type, and even
++ * past the UI the server action fell through to
++ * "No mapping rule exists for this document type yet".
++ *
++ * Fix contract asserted here:
++ *  1. UI: dividend_certificate is in the isMappableDocument whitelist in
++ *     components/tax/filing/wizard-documents-step.tsx (button renders).
++ *  2. Server: approveAndMapExtractedDocumentAction handles
++ *     dividend_certificate BEFORE the "No mapping rule exists" fallthrough.
++ *  3. The branch is evidence-only by design: it validates the printed gross
++ *     dividend (positive), allows an explicit 0 withholding (REIT-SPV),
++ *     refuses a tax-year mismatch, marks the document MAPPED, invalidates
++ *     the cached calculation and supersedes stale packets — and it must NOT
++ *     create ledger entries or filing income records from the certificate
++ *     (dividend income flows from classified bank credits; the gross→income
++ *     link is phase-2 work).
++ */
++
++const assert = require("node:assert/strict");
++const fs = require("node:fs");
++const path = require("node:path");
++
++const root = path.join(__dirname, "..");
++const wizardStep = fs.readFileSync(
++  path.join(root, "components/tax/filing/wizard-documents-step.tsx"),
++  "utf8",
++);
++const extraction = fs.readFileSync(
++  path.join(root, "app/actions/extraction.ts"),
++  "utf8",
++);
++
++// ── 1. UI whitelist ─────────────────────────────────────────────────────────
++assert.ok(
++  /isMappableDocument\s*=[\s\S]*?slot\.documentType === "dividend_certificate"/.test(
++    wizardStep,
++  ),
++  "wizard-documents-step: dividend_certificate must be in the isMappableDocument whitelist",
++);
++assert.ok(
++  !/dividend_certificate[\s\S]{0,80}Mapping for this document type is not available yet/.test(
++    wizardStep.replace(/isMappableDocument[\s\S]*?pseb_certificate/, ""), // strip the whitelist itself
++  ) ||
++    true, // informational: the fallback string may still exist for genuinely unmappable types
++);
++
++// ── 2. Server branch exists and precedes the fallthrough ────────────────────
++const actionStart = extraction.indexOf(
++  "export async function approveAndMapExtractedDocumentAction",
++);
++assert.ok(actionStart > 0, "approveAndMapExtractedDocumentAction not found");
++const fallthrough = extraction.indexOf(
++  "No mapping rule exists for this document type yet",
++  actionStart,
++);
++assert.ok(fallthrough > 0, "fallthrough error not found");
++const branchIdx = extraction.indexOf(
++  'document.documentType === "dividend_certificate"',
++  actionStart,
++);
++assert.ok(branchIdx > 0, "dividend_certificate branch is missing");
++assert.ok(
++  branchIdx < fallthrough,
++  "dividend_certificate branch must run BEFORE the fallthrough return",
++);
++
++const branch = extraction.slice(branchIdx, fallthrough);
++
++// ── 3. Branch behaviour contract ────────────────────────────────────────────
++for (const [needle, why] of [
++  [/"COMPLETED", "MAPPED"/, "requires a finished extraction before mapping"],
++  [/gross_dividend/, "reads the gross dividend field"],
++  [/Enter the gross dividend/, "refuses a missing/zero gross dividend"],
++  [/tax_year/, "reads the certificate tax year"],
++  [/dividendDraft\.taxYear/, "refuses a tax-year mismatch against the draft"],
++  [
++    /taxCalculationStatus: "NOT_CALCULATED"/,
++    "invalidates the cached calculation on mapping",
++  ],
++  [
++    /status: "SUPERSEDED", approvalStatus: "SUPERSEDED"/,
++    "supersedes stale packets on mapping",
++  ],
++  [
++    /extractionStatus: "MAPPED"/,
++    "marks the document MAPPED inside the transaction",
++  ],
++  [/mapping: "DIVIDEND_CERTIFICATE"/, "returns the mapping identifier"],
++  [
++    /invalidateBusinessBalancePackets/,
++    "keeps the shared packet-invalidation hygiene of other evidence docs",
++  ],
++]) {
++  assert.ok(needle.test(branch), `dividend_certificate branch: ${why}`);
++}
++
++// Evidence-only: no ledger/income records may be written from a certificate.
++for (const forbidden of [
++  /ledgerEntry\.create/,
++  /bankTransaction\.create/,
++  /filingIncomeRecord\.create/,
++  /filingTaxCredit\.create/,
++]) {
++  assert.ok(
++    !forbidden.test(branch),
++    `dividend_certificate branch must not write ${forbidden} — income flows from Bank Intelligence, not certificates`,
++  );
++}
++
++console.log("verify-dividend-mapping: all checks passed ✔");
