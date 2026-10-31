@@ -29,6 +29,7 @@ import {
 import { isPensionReviewDecisionField, pensionFieldKey, type PensionReviewDecisionKey } from "@/lib/tax/pension-statement-fields";
 import { PensionTaxReviewPanel } from "./pension-tax-review-panel";
 import { getTaxYearDateInputBounds } from "@/lib/tax/tax-year-period";
+import type { ApprovedBankProfitCertificate } from "@/lib/tax/bank-profit-certificate-fields";
 import { isDocumentExtractionLeaseStale } from "@/lib/tax/document-extraction-state";
 import {
   getSalaryCertificateFieldKind,
@@ -78,6 +79,7 @@ export type ExtractedPayload = {
   transactions?: ExtractedTransaction[];
   notes?: string[];
   purchaseBasisSourceEvidence?: string;
+  approvedBankProfitCertificate?: ApprovedBankProfitCertificate;
 };
 
 export type FilingDocumentRecord = {
@@ -272,9 +274,12 @@ export function WizardDocumentsStep({
           const isCnicDocument = slot.documentType === "cnic";
           const isSalaryCertificate =
             slot.documentType === "salary_certificate";
+          const isBankProfitCertificate =
+            slot.documentType === "bank_certificate";
           const isPensionStatement =
             slot.documentType === "pension_statement";
           const isMappableDocument =
+            isBankProfitCertificate ||
             isCnicDocument ||
             slot.documentType === "bank_statement" ||
             isSalaryCertificate ||
@@ -558,6 +563,8 @@ export function WizardDocumentsStep({
                         {isMapped
                           ? isPensionStatement
                             ? "Pension source is approved. Editing requires Save & Approve Map again, then a new tax calculation and packet. Changes are not applied until saved."
+                            : isBankProfitCertificate
+                            ? "Bank-profit certificate is approved. Any correction requires Save & Approve Map again; values or tax treatment are not inferred."
                             : employersEditableAfterMap
                             ? "This document is already mapped. The values below are read-only, except the employer names: change them and press Save employer."
                             : purchaseBasisMissing
@@ -631,7 +638,7 @@ export function WizardDocumentsStep({
                         </Button>
                       </div>
                     ) : (
-                      (!isMapped || purchaseBasisMissing) && (
+                      (!isMapped || purchaseBasisMissing || isBankProfitCertificate) && (
                         <div className="flex flex-wrap gap-2 sm:justify-end">
                           {isMappableDocument ? (
                             <Button
@@ -724,6 +731,19 @@ export function WizardDocumentsStep({
                       </p>
                     )}
 
+                  {isBankProfitCertificate && (
+                    <p className="mb-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900">
+                      Copy the bank&apos;s printed instrument/category, Section /
+                      subsection, applied rate, ATL status, and Sukuk details
+                      exactly; do not infer a tax rule. Enter at least one
+                      taxpayer ID (CNIC or NTN) and one account ID (account
+                      number or IBAN). Gross profit minus tax withheld must
+                      equal net profit credited. A zero withholding amount must
+                      be confirmed from the certificate, not assumed.
+                    </p>
+                  )}
+
+
                   {hasFields ? (
                     <div className="grid gap-3 sm:grid-cols-2">
                       {extracted.fields?.map((field, fieldIndex) => {
@@ -754,6 +774,7 @@ export function WizardDocumentsStep({
                           "cnic_number",
                           "cnic",
                           "identity_number",
+                          "taxpayer_cnic",
                         ].includes(normalizedFieldLabel);
                         const isNameField = [
                           "name",
@@ -1072,11 +1093,13 @@ export function WizardDocumentsStep({
                               )}
                               {typeof field.confidence === "number" &&
                                 field.confidence > 0 &&
-                                // A missing pension fact has no confidence to
-                                // show: a stale extraction score must not make
-                                // an unstated amount look verified.
+                                // A missing pension or bank-profit-certificate
+                                // fact has no confidence to show: a stale
+                                // extraction score must not make an unstated
+                                // or unread value look verified.
                                 !(
-                                  isPensionStatement &&
+                                  (isPensionStatement ||
+                                    isBankProfitCertificate) &&
                                   (field.value === null ||
                                     field.value === undefined ||
                                     String(field.value).trim() === "")
@@ -1157,6 +1180,7 @@ export function WizardDocumentsStep({
                               }
                               readOnly={
                                 isMapped &&
+                                !isBankProfitCertificate &&
                                 !(
                                   ibanEditableAfterMap &&
                                   isBankStatementIbanLabel(field.label)

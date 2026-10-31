@@ -1123,15 +1123,11 @@ function HandoffCompleteCard({
             },
     );
 
-    // Pension packets never carry employer names, so on a pension filing the
-    // "none" employer state is the expected outcome, not an attention item;
-    // a named outcome (added / confirmed / needs review) still gets its row.
-    const employerOutcomeKnown = [
-      "confirmed_by_taxpayer",
-      "listed",
-      "needs_review",
-    ].includes(scope?.employers ?? "");
-    if (!pensionRoute || employerOutcomeKnown) {
+    // An employer-less filing (Pension packets, Bank Profit-only returns, or a
+    // salary run that never planned employer rows) has no Employment flow and
+    // gets no employer row at all; a named outcome (added / confirmed / needs
+    // review) still gets its row.
+    if (scope?.employers !== "none") {
       rows.push(
         scope?.employers === "confirmed_by_taxpayer"
           ? {

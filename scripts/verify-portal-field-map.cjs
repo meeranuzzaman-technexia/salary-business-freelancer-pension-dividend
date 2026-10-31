@@ -155,7 +155,89 @@ test("unmapped categories become a named gap, never 'Other Receipts' 5028", () =
   const bank = map.mappingGaps.unmappedCategories.find((g) => g.category === "BANK_PROFIT");
   check("with its amount", bank.totalAmount, 400000);
   check("with its source rows", bank.entryIds, ["b1"]);
-  assert.match(bank.reason, /final-tax/i, "and a reason that says why");
+  assert.match(bank.reason, /final[\s-]*tax/i, "and a reason that says why");
+});
+
+test("approved bank profit maps statement gross, certificate WHT and calculated final tax to the captured child row", () => {
+  const { map, fields } = buildOver(
+    [
+      { id: "bp-1", entryType: "INCOME", category: "BANK_PROFIT", description: "Bank profit", amount: 45000 },
+    ],
+    {
+      bankProfitSource: {
+        documentId: "certificate-1",
+        subcategory: "bank-or-financial-institution-deposit",
+        investment: "Bank savings deposit",
+        contents: "1. PK00TEST0000000000000000\n2. Bank savings deposit\n3. Test Bank Limited",
+        statementGrossProfit: 45000,
+        taxDeducted: 9000,
+        taxChargeable: 9000,
+      },
+    },
+  );
+  const bank = fields.filter((field) => field.irisCode === "64040052");
+  check("three final-tax cells are queued", bank.length, 3);
+  check(
+    "captured final-tax cells",
+    bank.map((field) => [field.column, field.value]),
+    [
+      ["Taxable Amount", "45000"],
+      ["Tax Deducted", "9000"],
+      ["Tax Chargeable", "9000"],
+    ],
+  );
+  check("bank route opens Other Sources", bank.every((field) => field.leftPanel === "Other Sources"), true);
+  check("bank route opens Tax Deductions", bank.every((field) => field.leftSection === "Tax Deductions"), true);
+  check("bank investment detail reaches every amount field", bank.every((field) => field.bankProfitInvestment === "Bank savings deposit" && field.bankProfitContents.includes("Test Bank Limited")), true);
+  check("statement ledger income is not left as a manual gap", map.mappingGaps.unmappedCategories.some((gap) => gap.category === "BANK_PROFIT"), false);
+  check("gross appears once in total income", map.computationHints.totalIncome, 45000);
+});
+
+test("every supported profit category maps to its exact Final Tax popup code", () => {
+  for (const [subcategory, code] of [
+    ["bank-or-financial-institution-deposit", "64040052"],
+    ["government-securities-non-individual", "64040053"],
+    ["other-profit-on-debt", "64040054"],
+    ["sukuk-company", "64330056"],
+    ["sukuk-individual-aop-above-1m", "64330055"],
+    ["sukuk-individual-aop-below-1m", "64330054"],
+  ]) {
+    const { map, fields } = buildOver(
+      [{ id: "bp-1", entryType: "INCOME", category: "BANK_PROFIT", description: subcategory, amount: 45000 }],
+      {
+        bankProfitSource: {
+          documentId: "certificate-1",
+          subcategory,
+          investment: subcategory,
+          contents: `1. Certificate\n2. ${subcategory}\n3. Test Institution`,
+          statementGrossProfit: 45000,
+          taxDeducted: 9000,
+          taxChargeable: 9000,
+        },
+      },
+    );
+    check(`${subcategory} queues three exact cells`, fields.filter((field) => field.irisCode === code).length, 3);
+    check(`${subcategory} is not left as a gap`, map.mappingGaps.unmappedCategories.some((gap) => gap.category === "BANK_PROFIT"), false);
+  }
+});
+
+test("a bare Section 151 credit cannot fall back to the old Adjustable Tax row", () => {
+  const map = buildPortalFieldMap({
+    taxYear: 2026,
+    filerType: "myself",
+    taxpayerListStatus: "ATL",
+    ledgerEntries: [],
+    taxCredits: [
+      { id: "wht-1", section: "151(1)(b)", subcategory: "bank", amount: 9000, source: "BANK" },
+    ],
+  });
+  check("old adjustable row is not queued", flattenPortalFieldMap(map).some((field) => field.irisCode === "64040002"), false);
+  // Ours records it under captureUnverified (IRIS renders 64040002 as a
+  // computed row on the captured portal — entering it would be rejected);
+  // TR lists it as an unmapped category. Either way it stays visible, never
+  // silently dropped.
+  check("credit remains visible as a mapping gap", map.mappingGaps.captureUnverified[0].category, "TAX_151(1)(B)");
+  check("capture evidence explains why nothing is entered", /no writeable cell/.test(map.mappingGaps.captureUnverified[0].reason), true);
 });
 
 test("pension is written once, on one IRIS line", () => {
@@ -445,8 +527,8 @@ test("the map is versioned so an old packet cannot masquerade as a new one", () 
     taxpayerListStatus: "ATL",
     ledgerEntries: salaryOnlyLedger(1, 1000),
   });
-  check("packet map version", map.version, "1.1.0");
-  check("selector bundle stamp", map.selectorBundle.version, "v1.1-2026-09-09-iris2-capture");
+  check("packet map version", map.version, "1.3.0");
+  check("selector bundle stamp", map.selectorBundle.version, "v1.3-2026-10-23-bank-profit-investment");
 });
 
 test("the agent's completion status and the app's gate agree (no invented 'COMPLETED')", () => {

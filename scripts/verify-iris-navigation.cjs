@@ -361,6 +361,22 @@ function sandbox(names, extras = {}) {
   const ctx = vm.createContext({
     AGENT_NAME: require("../electron-connect/branding.js").AGENT_NAME,
     brandWindow: require("../electron-connect/branding.js").brandWindow,
+    pensionEntryHold: require("../electron-connect/pension-guard.js").pensionEntryHold,
+    // Keep the source-extracted autofill tests aligned with main.js's explicit
+    // tax-deduction grid contract (salary withholding + pension final tax + the
+    // §150 dividend Final Tax rows), plus the Bank Profit row driver main.js
+    // requires at module scope.
+    TAX_DEDUCTION_GRID_BY_CODE: Object.freeze({
+      "64020004": "Adjustable Tax",
+      "64020007": "Final Tax",
+      "64030052": "Final Tax",
+      "64030055": "Final Tax",
+      "64030090": "Final Tax",
+      "64330050": "Final Tax",
+      "64330066": "Final Tax",
+      "64030064": "Final Tax",
+    }),
+    irisBankProfitRowDriver: require("../electron-connect/iris-bank-profit-row-driver.js"),
     console,
     Promise,
     Date,
@@ -1109,7 +1125,7 @@ test("fix43: the agent keeps Salary default and adds only packet-backed verified
   const source = functionSource("runLocalIrisNavigationCheck");
   assert.ok(
     source.includes("sectionIds: handoffSectionIds") &&
-      source.includes("salaryRequested ? irisNavigation.SALARY_WITHHOLDING_SECTION_IDS : []") &&
+      source.includes("salaryTourRequested ? irisNavigation.SALARY_WITHHOLDING_SECTION_IDS : []") &&
       source.includes('!["business-entry-v1", "business-entry-v2"].includes(snapshot.business?.version)'),
     "navigation must use the salary default or an explicitly versioned business payload",
   );
@@ -1117,6 +1133,119 @@ test("fix43: the agent keeps Salary default and adds only packet-backed verified
     !source.includes("sectionIds: irisNavigation.ALL_SECTION_IDS"),
     "the wealth-blocked plan must no longer be requested",
   );
+});
+
+test("fix53: Bank Profit-only routes begin at Other Sources; Salary appears only when explicitly selected", () => {
+  // Ours builds the handoff list inline in main.js (dividend fork predates
+  // TR's centralized buildHandoffSectionIds), so the same routing rules are
+  // pinned at the source: Bank Profit queues Other Sources > Tax Deductions
+  // (deduped against the dividend arm), Salary stays demand-driven, and a
+  // first-section of Other Sources is explicitly accepted + started at cursor
+  // zero by the navigator.
+  const source = functionSource("runLocalIrisNavigationCheck");
+  assert.ok(
+    source.includes('bankProfitRequested ? ["other_sources_tax_deductions"] : []'),
+    "a Bank Profit packet must queue the Other Sources tax-deduction section",
+  );
+  assert.ok(
+    source.includes("new Set([") && source.includes('dividendTaxDeductionRequested ? ["other_sources_tax_deductions"] : []'),
+    "dividend and Bank Profit arms dedupe the shared Other Sources section",
+  );
+  assert.ok(
+    source.includes("const salaryTourRequested =") &&
+      source.includes("salaryRequested && !dividendOnlyRoute && !bankProfitOnlyRoute"),
+    "Salary is requested only by the salary gate — never as a non-business default",
+  );
+  // Live-verified 2026-10-28 (job cmvs1lt02000d14d1u5o054xj): a Bank
+  // Profit-only return renders no Employment panel either, so the guard must
+  // suppress the salary tour exactly like the dividend-only route does.
+  assert.ok(
+    source.includes("const bankProfitOnlyRoute =") &&
+      source.includes("bankProfitRequested &&") &&
+      source.includes('!incomeSources.includes("salary")') &&
+      source.includes('!incomeSources.includes("pension")'),
+    "Bank Profit-only filings must skip the Employment/Salary tour like dividend-only filings",
+  );
+  const nav = fs.readFileSync(
+    path.join(__dirname, "../electron-connect/iris-navigation.js"),
+    "utf8",
+  );
+  assert.ok(
+    nav.includes('OTHER_SOURCES_CONTRACT_IDS.has(tourPlan[0]?.id)'),
+    "Other Sources is an accepted first section of the inspection plan",
+  );
+  assert.ok(
+    nav.includes('tourPlan[0].group === "Other Sources"'),
+    "an Other Sources-only plan starts the tour at cursor zero instead of hunting Salary",
+  );
+  // Functional: the route table must place every Bank Profit code in that
+  // section, even when no captured row of it exists yet.
+  assert.deepEqual(
+    navigation.planSectionFills(
+      [{ irisCode: "64040052", column: "Taxable Amount", value: "1", sourceGroup: "bankProfitFields" }],
+      null,
+    ).groups.map((group) => ({ sectionId: group.sectionId, gridTitle: group.gridTitle })),
+    [{ sectionId: "other_sources_tax_deductions", gridTitle: "Final Tax" }],
+  );
+  assert.equal(
+    navigation.validateRequiredGridTarget("other_sources_tax_deductions", "Final Tax", ["7052"]).status,
+    "unsupported_grid_rows",
+  );
+});
+
+test("fix64: the Bank Profit fill names the Final Tax grid again so a post-census collapse is re-expanded (TR merge parity)", () => {
+  // Live regression (job cmvs225jp000dij3ef5d0mov6, 2026-10-28): the census
+  // tour re-collapsed Other Sources > Tax Deductions after the section tour
+  // had expanded both grids; fillGroup then saw the section already_active,
+  // ran no grid expansion, and the row driver held all three figures with
+  // final_tax_grid_unverified. TR-BankProfit navigates this group with the
+  // grid title (Final Tax) and empty row codes; the merge inlined neither.
+  assert.match(
+    mainSource,
+    /requiredGridTitle: isBankProfitFinalTaxGroup\s*\?\s*"Final Tax"/,
+    "Bank Profit groups must navigate with the exact Final Tax grid named",
+  );
+  for (const code of ["64040052", "64040053", "64040054", "64330054", "64330055", "64330056"]) {
+    assert.ok(
+      mainSource.includes(`"${code}": "Final Tax"`),
+      `${code}: every Bank Profit code maps to the Final Tax accordion like TR-BankProfit`,
+    );
+  }
+  const nav = fs.readFileSync(
+    path.join(__dirname, "../electron-connect/iris-navigation.js"),
+    "utf8",
+  );
+  assert.ok(
+    nav.includes("verifiedAbsentGridRoute") && nav.includes("VERIFIED_ABSENT_CODE_ROUTES"),
+    "the navigation entry guard must accept the verified absent-row grid contract (title + zero codes)",
+  );
+  assert.ok(
+    navigation.validateRequiredGridTarget("other_sources_tax_deductions", "Final Tax", []).ok,
+    "the verified absent-row Bank Profit route may name its grid with no row codes",
+  );
+  assert.equal(
+    navigation.validateRequiredGridTarget("tax_deductions", "Final Tax", []).status,
+    "unsupported_grid_rows",
+    "no other section may name a tax grid without codes",
+  );
+});
+
+test("fix64: the entry guard still refuses every non-verified empty-code grid naming", async () => {
+  // The guard runs before any window access, so a null window is untouched.
+  for (const [sectionId, gridTitle, status] of [
+    ["tax_deductions", "Final Tax", "unsupported_grid_rows"],
+    ["other_sources_tax_deductions", "Adjustable Tax", "unsupported_grid_rows"],
+    ["business_tax_deduction", "Final Tax", "unsupported_grid_rows"],
+  ]) {
+    const refused = await navigation.navigateToSection(null, {
+      sectionId,
+      taxYear: 2026,
+      requiredGridTitle: gridTitle,
+      requiredRowCodes: [],
+    });
+    assert.equal(refused.ok, false, `${sectionId} / ${gridTitle}`);
+    assert.equal(refused.status, status, `${sectionId} / ${gridTitle}`);
+  }
 });
 
 test("fix55: packet v8 is accepted by the global and every business feature gate", () => {
@@ -2172,6 +2301,228 @@ test("overwrite guard surfaces IRIS-vs-packet conflicts and unexpected pre-fille
     }),
   }).runRealIrisAutofill(packet(), { id: "job-1" }, "live");
   assert.equal(clean.paused, false);
+});
+
+test("Bank Profit ignores a filled non-target category but still blocks a filled target category", async () => {
+  const filler = require("../electron-connect/iris-row-filler");
+  const driver = require("../electron-connect/iris-bank-profit-row-driver");
+  const tour = {
+    complete: true,
+    sections: [{
+      id: "other_sources_tax_deductions",
+      rows: [{ code: "64040053" }],
+      mappingVerified: true,
+    }],
+  };
+  const packet = {
+    filingPacket: {
+      taxYear: 2026,
+      snapshot: {
+        portalFieldMap: [{
+          irisCode: "64040053",
+          column: "Taxable Amount",
+          value: "1250000",
+          bankProfitInvestment: "Government securities",
+          bankProfitContents: "Certificate detail",
+        }],
+      },
+    },
+  };
+  const makeCtx = ({ snapshot, status }) => sandbox(["runRealIrisAutofill"], {
+    ensureWorkerWindow: async () => ({
+      isDestroyed: () => false,
+      webContents: { executeJavaScript: async () => ({ returnWorkspace: true }) },
+    }),
+    launchState: { accountReference: "1234567890123" },
+    activeJobExecutionLog: null,
+    pushStatus: () => {},
+    captureWindowScreenshot: async () => null,
+    lastSectionTour: tour,
+    irisNavigation: {
+      ...navigation,
+      navigateToSection: async () => ({ ok: true, status: "switched", gridTitle: "Final Tax" }),
+    },
+    irisBankProfitRowDriver: {
+      ...driver,
+      ensureBankProfitFinalTaxRow: async () => ({ ok: true, status: "row_present" }),
+    },
+    irisRowFiller: {
+      ...filler,
+      snapshotIrisRows: async () => snapshot,
+      fillIrisRows: async (_win, fields) => ({
+        results: fields.map((field) => status === filler.FILL_STATUS.OVERWRITE_NEEDS_CONFIRMATION
+          ? { ...field, status, existingValue: "2465", plannedValue: "1250000" }
+          : { ...field, status }),
+        summary: {},
+      }),
+    },
+  });
+
+  const nonTargetFilled = await makeCtx({
+    snapshot: [
+      { code: "64040052", description: "Bank Accounts / Deposits", cells: [{ editable: true, value: "2465" }] },
+      { code: "64040053", description: "Government Securities", cells: [{ editable: true, value: "" }] },
+    ],
+    status: filler.FILL_STATUS.FILLED,
+  }).runRealIrisAutofill(packet, { id: "bank-profit-non-target", type: "tax_assisted_filing" }, "live");
+  assert.equal(nonTargetFilled.paused, false);
+  assert.equal(nonTargetFilled.result.unexpectedPrefill.length, 0);
+
+  const targetFilled = await makeCtx({
+    snapshot: [{ code: "64040053", description: "Government Securities", cells: [{ editable: true, value: "2465" }] }],
+    status: filler.FILL_STATUS.OVERWRITE_NEEDS_CONFIRMATION,
+  }).runRealIrisAutofill(packet, { id: "bank-profit-target", type: "tax_assisted_filing" }, "live");
+  assert.equal(targetFilled.paused, true);
+  assert.match(targetFilled.pauseMessage, /64040053 \(IRIS 2465, packet 1250000\).*NOT overwritten/);
+});
+
+test("Phase G offline E2E: a mixed Bank Profit + Sukuk packet drives the real row driver once per code, dividend row untouched", async () => {
+  const { FakeIrisBankProfit } = require("./lib/fake-iris-bank-profit.cjs");
+  const driver = require("../electron-connect/iris-bank-profit-row-driver");
+  const INV = "Bank current deposit — HBL";
+  const CONT = "1. Account / IBAN PK36HABB0018067900476803\n2. Current deposit\n3. Habib Bank Limited";
+  const fake = new FakeIrisBankProfit({
+    targets: [
+      ["64040052", "Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits"],
+      ["64330054", "Return on Investment in Sukuks u/s 151(1A) @ 10%"],
+    ],
+    existingSources: [{ code: "64030052", label: "Dividend — 15% (§150)", detail: false }],
+  });
+  // Model the verified-live §150 dividend row: directly writable Taxable
+  // Amount / Tax Deducted cells, computed Tax Chargeable. The figures already
+  // match the packet, so the agent must leave the row byte-identical.
+  const dividendParent = fake.container.querySelector(
+    '.tableRows.dataRow[id="64030052"]:not(.section-detail-child-row)',
+  );
+  dividendParent.querySelectorAll("input").forEach((input, index) => {
+    input.disabled = index === 2;
+    input.value = ["1000", "150", ""][index];
+  });
+
+  const setups = [];
+  const ctx = sandbox(["runRealIrisAutofill"], {
+    ensureWorkerWindow: async () => ({
+      isDestroyed: () => false,
+      webContents: {
+        ...fake.webContents,
+        executeJavaScript: (source, ...args) => {
+          // The return-workspace probe is a structural read, not a Bank Profit
+          // page action; the fixture carries no dashboard chrome, so answer it
+          // from the JSDOM document instead of running the portal script.
+          if (/returnWorkspace/.test(String(source))) {
+            return Promise.resolve({
+              returnWorkspace: true,
+              inputs: fake.document.querySelectorAll("input").length,
+            });
+          }
+          return fake.webContents.executeJavaScript(source, ...args);
+        },
+      },
+    }),
+    launchState: { accountReference: "1234567890123" },
+    activeJobExecutionLog: null,
+    pushStatus: () => {},
+    captureWindowScreenshot: async () => null,
+    lastSectionTour: {
+      complete: true,
+      sections: [
+        {
+          id: "other_sources_tax_deductions",
+          mappingVerified: true,
+          rows: [{ code: "64030052" }],
+        },
+      ],
+    },
+    irisNavigation: {
+      ...navigation,
+      navigateToSection: async () => ({ ok: true, status: "switched", gridTitle: "Final Tax" }),
+    },
+    irisBankProfitRowDriver: {
+      ...driver,
+      ensureBankProfitFinalTaxRow: async (win, options) => {
+        setups.push({
+          code: options.code,
+          investment: options.investment,
+          contents: options.contents,
+        });
+        return driver.ensureBankProfitFinalTaxRow(win, options);
+      },
+    },
+    // The real filler types into the JSDOM grid and reads the figures back —
+    // this is the end-to-end claim this test exists to prove.
+    irisRowFiller: require("../electron-connect/iris-row-filler.js"),
+    // The web-job liveness probe needs the desktop's token store; in a
+    // sandboxed VM there is none, so the guard stands aside (the row-driver
+    // gates cover its real behaviour).
+    ensureNavigationJobActive: async () => {},
+  });
+
+  const bpFields = (code, label, investment, contents, amounts) =>
+    [["Taxable Amount", amounts[0]], ["Tax Deducted", amounts[1]], ["Tax Chargeable", amounts[2]]].map(
+      ([column, value]) => ({
+        irisCode: code,
+        label,
+        column,
+        value,
+        bankProfitInvestment: investment,
+        bankProfitContents: contents,
+      }),
+    );
+  const packet = {
+    filingPacket: {
+      taxYear: 2026,
+      snapshot: {
+        portalFieldMap: [
+          ...bpFields("64040052", "Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits", INV, CONT, ["1250000", "187500", "187500"]),
+          ...bpFields("64330054", "Return on Investment in Sukuks u/s 151(1A) @ 10%", "Sukuk holding — Meezan Sovereign", "1. Certificate MEZ-123\n2. Sovereign sukuk\n3. Meezan Bank", ["10000", "1000", "1000"]),
+          { irisCode: "64030052", label: "Dividend — 15% (§150)", column: "Taxable Amount", value: "1000" },
+          { irisCode: "64030052", label: "Dividend — 15% (§150)", column: "Tax Deducted", value: "150" },
+        ],
+      },
+    },
+  };
+  const out = await ctx.runRealIrisAutofill(packet, { id: "phase-g-e2e", type: "tax_assisted_filing" }, "live");
+  // One verified row setup per Bank Profit code, in packet order.
+  assert.deepEqual(setups.map((entry) => entry.code), ["64040052", "64330054"]);
+  assert.equal(setups[0].investment, INV);
+  assert.equal(setups[0].contents, CONT);
+  // The run must end in the taxpayer-review pause ONLY because of the
+  // packet-external prefill rows each step-group legitimately reported.
+  assert.equal(out.paused, true, "the prefill review pause is the only expected pause");
+  assert.equal(out.pauseAction, "portal_autofill_review");
+  assert.ok(out.result.stopped !== true, "no safety stop — the run walked every group");
+  assert.equal(
+    out.result.results.filter((r) => !["filled", "already_correct"].includes(r.status)).length,
+    0,
+    "every packet field reached a terminal positive status",
+  );
+  // The Sukuk derived cell locked → exactly one guarded Calculate press, never Save/Submit.
+  assert.equal(out.result.bankProfitCalculated, true);
+  const clickTexts = fake.clicks.map((click) => click.text);
+  assert.deepEqual(clickTexts.filter((text) => ["Save", "Submit"].includes(text)), []);
+  assert.equal(clickTexts.filter((text) => text === "Calculate").length, 1, "only the Sukuk Tax Chargeable refresh may press Calculate");
+  // Every typed figure is readable back from the DOM.
+  const detailInputs = fake.document.querySelectorAll('.tableRows.dataRow.section-detail-child-row[id="64040052"] input');
+  assert.deepEqual([...detailInputs].map((input) => input.value), ["1250000", "187500", "187500"]);
+  const sukukInputs = fake.container.querySelectorAll('.dataRow[id="64330054"] input');
+  assert.deepEqual([...sukukInputs].map((input) => input.value), ["10000", "1000", "1000"]);
+  // §150 regression: the dividend row still holds exactly its packet figures,
+  // and both its fields were reported matched — never typed over.
+  const dividendInputs = dividendParent.querySelectorAll("input");
+  assert.deepEqual([...dividendInputs].map((input) => input.value), ["1000", "150", ""]);
+  const dividendEntries = out.result.results.filter((r) => r.irisCode === "64030052");
+  assert.equal(dividendEntries.length, 2);
+  assert.ok(dividendEntries.every((r) => r.status === "already_correct"));
+  // No IRIS-vs-packet fight was recorded.
+  assert.equal(out.result.overwriteConflicts.length, 0);
+  // Every prefill flag names only rows carrying figures (the packet-covered
+  // dividend row itself is never flagged in its own group).
+  assert.ok(out.result.unexpectedPrefill.every((row) => row.cells.length > 0));
+  assert.ok(
+    !out.result.unexpectedPrefill.some((row) => row.code === "64030052" && row.sectionId === "other_sources_tax_deductions" && row.cells.length === 0),
+  );
+  // Both chooser dialogs were left closed.
+  assert.equal(fake.document.querySelectorAll("mat-dialog-container").length, 0);
 });
 
 test("wealth figures in the packet are held out of the Salary fill and reported as prepared, not entered", async () => {
@@ -4038,7 +4389,105 @@ test("completion card: unchecked manual entry is never certified as complete", (
   assert.match(text, /agent could not check/);
 });
 
+test("completion card: Bank Profit-only filing has no employer-review block", () => {
+  const { text } = renderHandoffCompletion({ employers: "none" });
+  assert.doesNotMatch(text, /Employer details/);
+});
+
 // fix43: fixed business contracts; no live taxpayer data or external requests.
+function bankProfitFixture() {
+  const row = (detail) => `<div class="tableRows dataRow${detail ? " section-detail-child-row" : ""}" id="64040052">
+    <div class="row-description-text">Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits${detail ? " --" : ""}</div>
+    <div class="data-first-child">64040052</div>
+    <div class="columns-parent">${[0, 1, 2]
+      .map((index) => `<div class="data-middle-child-wapper"><input type="text" ${!detail ? "disabled" : ""} data-column="${index}"></div>`)
+      .join("")}</div>
+  </div>`;
+  const finalTax = `<div id="bank-profit-grid" hidden><div class="wf-section-modal-accordion"><mat-expansion-panel class="mat-expanded">
+    <mat-expansion-panel-header aria-expanded="true">Final Tax</mat-expansion-panel-header>
+    <div class="mat-expansion-panel-content"><div class="mat-expansion-panel-body">
+      <div class="heading-bar"><strong>Description</strong><strong>Code</strong><strong>Taxable Amount</strong><strong>Tax Deducted</strong><strong>Tax Chargeable</strong></div>
+      ${row(false)}${row(true)}
+    </div></div>
+  </mat-expansion-panel></div></div>`;
+  const otherSources = `<mat-expansion-panel><mat-expansion-panel-header aria-expanded="false" onclick="actions.push('OTHER_SOURCES_PANEL');this.setAttribute('aria-expanded','true');this.classList.add('mat-expanded')">Other Sources</mat-expansion-panel-header>
+    <div class="mat-expansion-panel-content"><button class="data-tab-left-btn" onclick="actions.push('OTHER_SOURCES_TAX_DEDUCTIONS_TAB');this.classList.add('active');document.getElementById('bank-profit-grid').hidden=false">Tax Deductions</button>${finalTax}</div>
+  </mat-expansion-panel>`;
+  return `<!doctype html><html><head><meta charset="utf-8">${readinessStyle}<style>
+    .heading-bar strong{display:inline-block;margin:8px}.dataRow{display:flex;padding:5px}.columns-parent{display:flex}input{width:100px}
+  </style></head><body><app-nitr-workflow>${readinessHeader}<app-nitr-wf-body><div class="custom-tabs"><div class="sticky-tabs-head"><div class="head"><div class="title active">Data</div></div></div><div class="body interface_21 active">
+    ${readinessEmployment()}${otherSources}
+  </div></div></app-nitr-wf-body></app-nitr-workflow><button onclick="actions.push('SAVE')">Save</button><button onclick="actions.push('CALCULATE')">Calculate</button><button onclick="actions.push('SUBMIT')">Submit</button><script>window.actions=[]</script></body></html>`;
+}
+
+// fix64 regression fixture (live job cmvs225jp000dij3ef5d0mov6, 2026-10-28):
+// Other Sources > Tax Deductions is STILL the active section after the census
+// tour walked away, but both accordion grids re-collapsed. The Bank Profit
+// navigation must re-expand only the verified Final Tax grid before the row
+// driver inspects it. No FBR request, account, or real taxpayer data.
+function bankProfitPostCensusFixture() {
+  const lockedAncestorRow = `<div class="tableRows dataRow" id="999918"><div class="row-description-text">Rent from Property (locked)</div>
+    <div class="columns-parent">${[0, 1, 2]
+      .map(() => `<div class="data-middle-child-wapper"><input type="text" disabled></div>`)
+      .join("")}</div></div>`;
+  const grids = `<div class="wf-section-modal-accordion">
+    <mat-expansion-panel><mat-expansion-panel-header aria-expanded="false">Adjustable Tax</mat-expansion-panel-header>
+      <div class="mat-expansion-panel-content" hidden></div></mat-expansion-panel>
+    <mat-expansion-panel><mat-expansion-panel-header id="final-header" aria-expanded="false">Final Tax</mat-expansion-panel-header>
+      <div class="mat-expansion-panel-content" id="final-content" hidden><div class="mat-expansion-panel-body">
+        <div class="heading-bar"><strong>Description</strong><strong>Code</strong><strong>Taxable Amount</strong><strong>Tax Deducted</strong><strong>Tax Chargeable</strong></div>
+        ${lockedAncestorRow}
+      </div></div></mat-expansion-panel>
+  </div>`;
+  const otherSources = `<mat-expansion-panel class="mat-expanded"><mat-expansion-panel-header aria-expanded="true">Other Sources</mat-expansion-panel-header>
+    <div class="mat-expansion-panel-content"><div class="mat-expansion-panel-body"><button class="data-tab-left-btn active" onclick="actions.push('OTHER_SOURCES_TAX_DEDUCTIONS_TAB')">Tax Deductions</button>${grids}</div></div>
+  </mat-expansion-panel>`;
+  return `<!doctype html><html><head><meta charset="utf-8">${readinessStyle}<style>
+    .heading-bar strong{display:inline-block;margin:8px}.dataRow{display:flex;padding:5px}.columns-parent{display:flex}input{width:100px}
+    mat-expansion-panel{display:block}.mat-expansion-panel-content{display:block}[hidden]{display:none!important}
+  </style></head><body><app-nitr-workflow>${readinessHeader}<app-nitr-wf-body><div class="custom-tabs"><div class="sticky-tabs-head"><div class="head"><div class="title active">Data</div></div></div><div class="body interface_21 active">
+    ${otherSources}
+  </div></div></app-nitr-wf-body></app-nitr-workflow><script>window.actions=[];
+  document.getElementById('final-header').addEventListener('click',()=>{
+    const h=document.getElementById('final-header');h.classList.add('mat-expanded');h.setAttribute('aria-expanded','true');
+    document.getElementById('final-content').hidden=false;window.actions.push('grid:Final Tax');
+  });</script></body></html>`;
+}
+
+test("fix64: Bank Profit navigation re-expands the post-census collapsed Final Tax grid", async () => {
+  await withPage(bankProfitPostCensusFixture(), async (page, win) => {
+    const result = await navigation.navigateToSection(win, {
+      sectionId: "other_sources_tax_deductions",
+      taxYear: 2026,
+      taxpayerIdentifier: "1234567890123",
+      requiredGridTitle: "Final Tax",
+      requiredRowCodes: [],
+    });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.status, "grid_ready");
+    assert.equal(result.gridTitle, "Final Tax");
+    const actions = await page.evaluate("actions");
+    assert.equal(
+      actions.filter((action) => action === "grid:Final Tax").length,
+      1,
+      `exactly one expand click on the verified grid header: ${JSON.stringify(actions)}`,
+    );
+    const section = result.inspection.frames[0].section;
+    assert.equal(section.id, "other_sources_tax_deductions");
+    assert.equal(
+      section.fieldGridPanels.find((panel) => panel.title === "Final Tax")
+        .expanded,
+      true,
+    );
+    assert.equal(
+      section.fieldGridPanels.find((panel) => panel.title === "Adjustable Tax")
+        .expanded,
+      false,
+      "an unneeded grid is never touched",
+    );
+  });
+});
+
 function businessFixture() {
   const specs = navigation.BUSINESS_CONTRACT;
   const tabs = Object.entries(specs).map(([id, s]) => `<button class="data-tab-left-btn" onclick="actions.push('${id}');document.querySelectorAll('.data-tab-left-btn').forEach(b=>b.classList.remove('active'));this.classList.add('active');document.querySelectorAll('.business-grid').forEach(g=>g.hidden=true);document.getElementById('${id}').hidden=false">${s.tab}</button>`).join('');
@@ -4055,6 +4504,24 @@ test('fix43: business-only navigation verifies both grids without requiring Empl
     assert.ok(!(await page.evaluate('actions')).some(a=>['SAVE','CALCULATE','SUBMIT','SALARY_TAB'].includes(a)));
   });
 });
+
+test('fix53: Bank Profit-only navigation verifies Other Sources first without searching Employment/Salary', async () => {
+  await withPage(bankProfitFixture(), async (page, win) => {
+    const out = await navigation.inspectNavigation(win, {
+      taxYear: 2026,
+      taxpayerIdentifier: '1234567890123',
+      openReturn: true,
+      inspectSections: true,
+      sectionIds: ['other_sources_tax_deductions'],
+    });
+    assert.equal(out.requiredAction, 'portal_sections_inspected');
+    assert.deepEqual(out.inspection.sectionTour.sections.map(section => section.id), ['other_sources_tax_deductions']);
+    assert.equal(out.inspection.sectionTour.sections[0].mappingVerified, true);
+    assert.deepEqual(await page.evaluate('actions'), ['OTHER_SOURCES_PANEL', 'OTHER_SOURCES_TAX_DEDUCTIONS_TAB']);
+    assert.ok(!(await page.evaluate('actions')).some(action => ['EXPAND_EMPLOYMENT', 'SALARY_TAB', 'SAVE', 'CALCULATE', 'SUBMIT'].includes(action)));
+  });
+});
+
 
 test('fix43: verified business scalar writes read back; computed totals and Save/Calculate/Submit stay untouched', async () => {
   const filler = require('../electron-connect/iris-row-filler');

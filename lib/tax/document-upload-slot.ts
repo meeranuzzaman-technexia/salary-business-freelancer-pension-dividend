@@ -1,4 +1,5 @@
 import { getTy2026SubcategoryOptions } from "./rules/ty2026/subcategories";
+import { bankProfitCertificateSubcategory } from "./bank-profit-document-slot";
 
 export type FilingDocumentSlotResolution =
   | {
@@ -74,6 +75,10 @@ export function resolveFilingDocumentSlot(
 ): FilingDocumentSlotResolution {
   const requestedType = requestedDocumentType.trim();
   const suppliedAccountId = suppliedBankAccountId?.trim() || null;
+
+  if (requestedType.startsWith("bank_certificate:") && !bankProfitCertificateSubcategory(requestedType)) {
+    return { success: false, error: "Select a supported Bank Profit category" };
+  }
 
   if (requestedType.startsWith(BANK_STATEMENT_SLOT_PREFIX)) {
     const slotAccountId = requestedType

@@ -264,15 +264,81 @@ function balancePageOp(step) {
     Array.from(dialog.querySelectorAll("input")).filter(
       (input) => (input.getAttribute("placeholder") || "") === placeholder,
     );
-  const checkboxState = (dialog, label) => {
+  // The live Bank Account popup has already varied its IBAN presentation.  Do
+  // not fall back to a generic first input: resolve one *semantic* IBAN field
+  // only. A label/placeholder may contain the required-marker asterisk, but
+  // two candidate controls remain an ambiguity and are never typed into.
+  const fieldToken = (value) => norm(value).replace(/\s*\*+\s*$/, "").trim();
+  // Captured live Bank Account dialog names. These are explicit aliases, not
+  // a substring match: a similarly named field is still not safe to type in.
+  const bankIbanToken = (value) => fieldToken(value).replace(/\s*\/\s*/g, "/");
+  const isBankIbanField = (value) =>
+    ["iban", "iban/mobile wallet no.", "iban/mobile wallet no"].includes(
+      bankIbanToken(value),
+    );
+  const BANK_FOREIGN_CURRENCY_LABELS = [
+    "Foreign Currency/Others",
+    "Foreign Currency Account",
+  ];
+  const inputLabel = (dialog, input) => {
+    const labels = [];
+    const formField = input.closest("mat-form-field");
+    if (formField)
+      for (const label of formField.querySelectorAll(
+        "mat-label, label.mat-mdc-floating-label, label.mat-form-field-label",
+      ))
+        labels.push(label.textContent);
+    if (input.id)
+      for (const label of dialog.querySelectorAll("label[for]"))
+        if (label.htmlFor === input.id) labels.push(label.textContent);
+    if (input.getAttribute("aria-label")) labels.push(input.getAttribute("aria-label"));
+    const unique = [...new Set(labels.map(fieldToken).filter(Boolean))];
+    return unique.length === 1 ? unique[0] : "";
+  };
+  const visibleInputs = (dialog) =>
+    Array.from(dialog.querySelectorAll('input:not([type="hidden"])')).filter(
+      (input) =>
+        visible(input) &&
+        !["checkbox", "radio", "button", "submit", "reset", "file", "image"].includes(
+          String(input.getAttribute("type") || "text").toLowerCase(),
+        ),
+    );
+  const bankIbanResolution = (dialog) => {
+    const inputs = visibleInputs(dialog);
+    const placeholderMatches = inputs.filter((input) =>
+      isBankIbanField(input.getAttribute("placeholder") || ""),
+    );
+    const labelMatches = inputs.filter((input) => isBankIbanField(inputLabel(dialog, input)));
+    const candidates = [...new Set([...placeholderMatches, ...labelMatches])];
+    let matchedBy = "none";
+    if (placeholderMatches.length && labelMatches.length) matchedBy = "placeholder_or_label";
+    else if (placeholderMatches.length) matchedBy = "placeholder";
+    else if (labelMatches.length) matchedBy = "label";
+    return { inputs: candidates, matchedBy };
+  };
+  // This deliberately reports structure only: never field values, IBANs, or
+  // account titles. It makes a future IRIS layout change actionable while the
+  // live driver still closes the dialog without guessing.
+  const bankInputDiagnostics = (dialog) =>
+    visibleInputs(dialog).map((input) => ({
+      label: inputLabel(dialog, input),
+      placeholder: input.getAttribute("placeholder") || "",
+      formControlName: input.getAttribute("formcontrolname") || "",
+      type: input.getAttribute("type") || "text",
+      disabled: Boolean(input.disabled),
+      readOnly: Boolean(input.readOnly),
+    }));
+  const checkboxStateForLabels = (dialog, labels) => {
+    const wanted = new Set((labels || []).map(norm));
     const boxes = Array.from(dialog.querySelectorAll("mat-checkbox")).filter(
-      (box) => norm(box.textContent) === norm(label),
+      (box) => wanted.has(norm(box.textContent)),
     );
     if (boxes.length !== 1) return boxes.length ? "ambiguous" : "absent";
     const input = boxes[0].querySelector('input[type="checkbox"]');
     if (!input) return "absent";
     return input.checked ? "checked" : "unchecked";
   };
+  const checkboxState = (dialog, label) => checkboxStateForLabels(dialog, [label]);
   const setNative = (el, value) => {
     const setter = Object.getOwnPropertyDescriptor(
       window.HTMLInputElement.prototype,
@@ -602,11 +668,20 @@ function balancePageOp(step) {
   if (op === "dialog_set") {
     const placeholder = (CFG.placeholders[step.kind] || {})[step.field];
     if (!placeholder) return { status: "unsupported_field" };
-    const inputs = inputByPlaceholder(dialog, placeholder);
+    const iban = step.kind === "bank" && step.field === "iban";
+    const resolution = iban ? bankIbanResolution(dialog) : null;
+    const inputs = resolution ? resolution.inputs : inputByPlaceholder(dialog, placeholder);
+    const diagnostic = iban
+      ? { matchedBy: resolution.matchedBy, inputs: bankInputDiagnostics(dialog) }
+      : null;
     if (inputs.length !== 1)
-      return { status: inputs.length ? "ambiguous_field" : "field_not_found" };
+      return {
+        status: inputs.length ? "ambiguous_field" : "field_not_found",
+        ...(diagnostic ? { diagnostic } : {}),
+      };
     const el = inputs[0];
-    if (el.disabled || el.readOnly) return { status: "field_disabled" };
+    if (el.disabled || el.readOnly)
+      return { status: "field_disabled", ...(diagnostic ? { diagnostic } : {}) };
     setNative(el, String(step.value));
     return { status: "set", readback: String(el.value || "") };
   }
@@ -625,7 +700,10 @@ function balancePageOp(step) {
 
   if (op === "dialog_state") {
     const valueOf = (placeholder) => {
-      const inputs = inputByPlaceholder(dialog, placeholder);
+      const inputs =
+        step.kind === "bank" && isBankIbanField(placeholder)
+          ? bankIbanResolution(dialog).inputs
+          : inputByPlaceholder(dialog, placeholder);
       return inputs.length === 1 ? String(inputs[0].value || "") : "";
     };
     const state = { status: "ok", addEnabled: addEnabled(dialog) };
@@ -634,7 +712,10 @@ function balancePageOp(step) {
       state.accountTitle = valueOf("Account Title");
       state.bankName = valueOf("Bank Name");
       state.joint = checkboxState(dialog, "Joint Account");
-      state.foreignCurrency = checkboxState(dialog, "Foreign Currency/Others");
+      state.foreignCurrency = checkboxStateForLabels(
+        dialog,
+        BANK_FOREIGN_CURRENCY_LABELS,
+      );
     } else {
       const fields = CFG.placeholders.vehicle;
       state.registrationNo = valueOf(fields.registrationNo);
@@ -827,8 +908,18 @@ async function runBalanceSheetDriver(windowInstance, fields, options = {}) {
     onStep = () => {},
     sleep = defaultSleep,
     timeoutMs = 10000,
+    // A taxpayer-confirmed special Balance Sheet child row is only read back.
+    // It is never added or typed again by this driver.
+    verifyOnly = () => false,
+    checkEntry = (entry) => entry,
   } = options;
   const live = mode === "live";
+  const isVerifyOnly = (field) =>
+    typeof verifyOnly === "function" && Boolean(verifyOnly(field));
+  const checkedEntry = (field, entry) =>
+    isVerifyOnly(field) && typeof checkEntry === "function"
+      ? checkEntry(entry)
+      : entry;
   const plan = planBalanceWork(fields);
   const results = [];
   const setup = [];
@@ -859,7 +950,10 @@ async function runBalanceSheetDriver(windowInstance, fields, options = {}) {
 
   for (const field of plan.unsupported)
     results.push(
-      tag(field, { status: BALANCE_STATUS.UNSUPPORTED, setupStatus: "incomplete_packet_entry" }),
+      checkedEntry(
+        field,
+        tag(field, { status: BALANCE_STATUS.UNSUPPORTED, setupStatus: "incomplete_packet_entry" }),
+      ),
     );
   const todo = [...plan.banks, ...plan.vehicles, ...plan.properties];
   if (!todo.length) return { results, setup };
@@ -883,10 +977,13 @@ async function runBalanceSheetDriver(windowInstance, fields, options = {}) {
     );
     for (const field of todo)
       results.push(
-        tag(field, {
-          status: BALANCE_STATUS.SECTION_UNAVAILABLE,
-          setupStatus: moved && moved.status,
-        }),
+        checkedEntry(
+          field,
+          tag(field, {
+            status: BALANCE_STATUS.SECTION_UNAVAILABLE,
+            setupStatus: moved && moved.status,
+          }),
+        ),
       );
     return { results, setup };
   }
@@ -904,7 +1001,10 @@ async function runBalanceSheetDriver(windowInstance, fields, options = {}) {
     );
     for (const field of todo)
       results.push(
-        tag(field, { status: BALANCE_STATUS.SETUP_FAILED, setupStatus: "unexpected_dialog_open" }),
+        checkedEntry(
+          field,
+          tag(field, { status: BALANCE_STATUS.SETUP_FAILED, setupStatus: "unexpected_dialog_open" }),
+        ),
       );
     return { results, setup };
   }
@@ -1259,11 +1359,19 @@ async function runBalanceSheetDriver(windowInstance, fields, options = {}) {
     return { failure: "property_row_not_created" };
   }
 
+  // "Foreign Currency/Others" is optional in the live Bank Account dialog.
+  // Its absence means the option is unavailable, not selected. Joint Account
+  // is not optional: a checked or unrecognised state is always held.
+  const bankOptionsAreSafe = (state) =>
+    state &&
+    state.joint === "unchecked" &&
+    ["unchecked", "absent"].includes(state.foreignCurrency);
+
   async function addBank(field) {
     const failed = await openDialog("bank");
     if (failed) return { failure: failed };
     const before = await run({ op: "dialog_state", kind: "bank" });
-    if (before.joint !== "unchecked" || before.foreignCurrency !== "unchecked") {
+    if (!bankOptionsAreSafe(before)) {
       note(
         "bank_dialog_unexpected",
         `Bank Account dialog opened with Joint Account = ${before.joint}, Foreign Currency/Others = ${before.foreignCurrency}; closed without adding ${field.iban}.`,
@@ -1273,6 +1381,18 @@ async function runBalanceSheetDriver(windowInstance, fields, options = {}) {
     }
     const set = await run({ op: "dialog_set", kind: "bank", field: "iban", value: field.iban });
     if (set.status !== "set" || set.readback.toUpperCase() !== String(field.iban).toUpperCase()) {
+      if (set.diagnostic) {
+        const controls = (set.diagnostic.inputs || [])
+          .map(
+            (input, index) =>
+              `#${index + 1} label=${JSON.stringify(input.label || "")}, placeholder=${JSON.stringify(input.placeholder || "")}, formControlName=${JSON.stringify(input.formControlName || "")}, type=${JSON.stringify(input.type || "")}, disabled=${Boolean(input.disabled)}, readOnly=${Boolean(input.readOnly)}`,
+          )
+          .join("; ");
+        note(
+          "bank_iban_field_discovery",
+          `Bank Account IBAN field ${set.status} (matched by ${set.diagnostic.matchedBy || "none"}). Visible input metadata only: ${controls || "no visible non-hidden inputs"}. Dialog closed without adding ${field.iban}.`,
+        );
+      }
       await abandon("bank");
       return { failure: `bank_iban_${set.status === "set" ? "readback_differs" : set.status}` };
     }
@@ -1297,8 +1417,7 @@ async function runBalanceSheetDriver(windowInstance, fields, options = {}) {
     const state = resolved.value;
     if (
       state.iban.toUpperCase() !== String(field.iban).toUpperCase() ||
-      state.joint !== "unchecked" ||
-      state.foreignCurrency !== "unchecked"
+      !bankOptionsAreSafe(state)
     ) {
       note(
         "bank_dialog_changed",
@@ -1371,6 +1490,7 @@ async function runBalanceSheetDriver(windowInstance, fields, options = {}) {
   }
 
   const ready = [];
+  const verifyReady = [];
   const extras = new Map();
   let blocked = false;
   for (const field of todo) {
@@ -1380,11 +1500,27 @@ async function runBalanceSheetDriver(windowInstance, fields, options = {}) {
         "row_ambiguous",
         `${field.irisCode}: ${existing.length} rows already start with "${field.rowDescriptionIncludes}"; left alone.`,
       );
-      results.push(tag(field, { status: BALANCE_STATUS.AMBIGUOUS_ROW, rowCount: existing.length }));
+      results.push(
+        checkedEntry(
+          field,
+          tag(field, { status: BALANCE_STATUS.AMBIGUOUS_ROW, rowCount: existing.length }),
+        ),
+      );
       continue;
     }
     if (existing.length === 1) {
-      ready.push(field);
+      (isVerifyOnly(field) ? verifyReady : ready).push(field);
+      continue;
+    }
+    // A user-confirmed row is verification-only. Do not open its dialog or
+    // create a replacement row when the claimed child is absent.
+    if (isVerifyOnly(field)) {
+      results.push(
+        checkedEntry(
+          field,
+          tag(field, { status: "row_not_found", setupStatus: "child_row_missing_verify_only" }),
+        ),
+      );
       continue;
     }
     if (!live) {
@@ -1410,10 +1546,13 @@ async function runBalanceSheetDriver(windowInstance, fields, options = {}) {
     }
     if (outcome.failure) {
       results.push(
-        tag(field, {
-          status: outcome.status || BALANCE_STATUS.SETUP_FAILED,
-          setupStatus: outcome.failure,
-        }),
+        checkedEntry(
+          field,
+          tag(field, {
+            status: outcome.status || BALANCE_STATUS.SETUP_FAILED,
+            setupStatus: outcome.failure,
+          }),
+        ),
       );
       // A failed ADD may have left a dialog behind; nothing else is clicked then.
       const probe = await run({ op: "inspect", codes });
@@ -1424,11 +1563,15 @@ async function runBalanceSheetDriver(windowInstance, fields, options = {}) {
         );
         blocked = true;
         const index = todo.indexOf(field);
-        for (const rest of [...ready, ...todo.slice(index + 1)])
+        for (const rest of [...ready, ...verifyReady, ...todo.slice(index + 1)])
           results.push(
-            tag(rest, { status: BALANCE_STATUS.SETUP_FAILED, setupStatus: "dialog_left_open" }),
+            checkedEntry(
+              rest,
+              tag(rest, { status: BALANCE_STATUS.SETUP_FAILED, setupStatus: "dialog_left_open" }),
+            ),
           );
         ready.length = 0;
+        verifyReady.length = 0;
         break;
       }
       continue;
@@ -1438,18 +1581,22 @@ async function runBalanceSheetDriver(windowInstance, fields, options = {}) {
     ready.push(field);
   }
 
-  if (ready.length && !blocked) {
-    const outcome = await fillRows(ready, { dryRun: !live });
+  const placeReady = async (items, { dryRun, verify }) => {
+    if (!items.length || blocked) return;
+    const outcome = await fillRows(items, { dryRun });
     for (const entry of outcome.results || []) {
-      const source = ready.find((field) => field.key === entry.key) || {};
-      results.push(
-        tag(
-          { ...entry, kind: source.kind },
-          extras.has(entry.key) ? extras.get(entry.key) : {},
-        ),
+      const source = items.find((field) => field.key === entry.key) || {};
+      const tagged = tag(
+        { ...entry, kind: source.kind },
+        extras.has(entry.key) ? extras.get(entry.key) : {},
       );
+      results.push(verify ? checkedEntry(source, tagged) : tagged);
     }
-  }
+  };
+  // Confirmed manual rows are always a dry, read-only pass. Normal rows retain
+  // the existing live fill behavior.
+  await placeReady(verifyReady, { dryRun: true, verify: true });
+  await placeReady(ready, { dryRun: !live, verify: false });
   return { results, setup };
 }
 

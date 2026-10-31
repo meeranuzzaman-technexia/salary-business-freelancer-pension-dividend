@@ -122,6 +122,8 @@ export const stepLabels: Record<StepKey, string> = {
 export type TaxBreakdownLine = {
   source: string;
   subcategoryLabel?: string | null;
+  // Raw catalog subcategory key (e.g. the exact Bank Profit / Sukuk category).
+  subcategory?: string | null;
   section: string;
   ruleId: string;
   income: number;

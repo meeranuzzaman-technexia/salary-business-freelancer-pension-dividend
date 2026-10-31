@@ -108,6 +108,8 @@ import { validatePakistaniIban } from "@/lib/tax/iban";
 import { WizardIncomeSubcategoryStep } from "@/components/tax/filing/wizard-income-subcategory-step";
 import { WizardBusinessProfitStep } from "@/components/tax/filing/wizard-business-profit-step";
 import { businessProfitStepProblems } from "@/lib/tax/business-profit-step-check";
+import { bankProfitCertificateSlot } from "@/lib/tax/bank-profit-document-slot";
+import { BANK_PROFIT_FINAL_TAX_ROWS, type BankProfitSubcategory } from "@/lib/tax/iris-bank-profit-capture";
 import {
   TY2026_BUSINESS_PROFIT_LABEL,
   getTy2026AutomaticIncomeSelections,
@@ -793,15 +795,34 @@ export function FilingWizard({
         };
       });
 
+    // §151 bank profit: one certificate slot per selected profit category (the
+    // slot key carries the subcategory so uploads/mapping stay separate — same
+    // discipline as the dividend certificate slots above). TR-BankProfit port.
+    const bankProfitSlots = incomeSubcategorySelections
+      .filter((selection) => selection.source === "bank_profit")
+      .map((selection) => {
+        const subcategory = selection.subcategory as BankProfitSubcategory;
+        const target = BANK_PROFIT_FINAL_TAX_ROWS[subcategory];
+        return {
+          documentType: "bank_certificate",
+          slotKey: bankProfitCertificateSlot(subcategory),
+          label: `${target.description} certificate`,
+          reason: `Upload the certificate supporting IRIS row ${target.code}.`,
+          required: true,
+        };
+      });
+
     return [
       ...baseDocumentSlots.filter(
         (slot) =>
           slot.documentType !== "bank_statement" &&
+          slot.documentType !== "bank_certificate" &&
           slot.documentType !== "dividend_certificate" &&
           (slot.documentType !== "business_support" || (isMyself && taxYear === 2026)),
       ),
       ...bankSlots,
       ...(incomeSources.includes("dividend") ? dividendSlots : []),
+      ...bankProfitSlots,
     ];
   }, [baseDocumentSlots, bankAccounts, isMyself, taxYear, incomeSources, incomeSubcategorySelections]);
 
@@ -2013,6 +2034,9 @@ export function FilingWizard({
 
   function goBack() {
     const previousStep = Math.max(0, currentStepRef.current - 1);
+    // A step-scoped gate message (e.g. the Bank Intelligence classification
+    // gate) must not linger on a step that did not raise it.
+    setFilingActionError(null);
     currentStepRef.current = previousStep;
     setStep(previousStep);
   }
@@ -2835,6 +2859,9 @@ export function FilingWizard({
         summaryRows={summaryRows}
         blockers={currentBlockers}
         onRailItemClick={(index) => {
+          // Same rule as goBack: leaving a step clears its action error so it
+          // cannot bleed onto an unrelated step's banner slot.
+          setFilingActionError(null);
           currentStepRef.current = index;
           setStep(index);
         }}

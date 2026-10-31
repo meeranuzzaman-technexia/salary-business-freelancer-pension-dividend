@@ -105,6 +105,42 @@ test("completed run: fields say who typed what, employers say who added them", (
   assert.doesNotMatch(out, /HUGE/, "noisy steps are left out");
 });
 
+test("job report distinguishes a read-back confirmed manual bank row from an unchecked legacy acknowledgement", () => {
+  const common = {
+    savedAt: "2026-10-31T04:12:27.679Z",
+    jobId: "bank-readback",
+    build: "test",
+    finalStatus: "paused",
+    result: {
+      autofill: {
+        results: [],
+        takenOver: [{
+          key: "3320:businessFields:Amount:Bank Account - PK35HABB0018067900476803 -",
+          name: "Bank Account PK35HABB0018067900476803 (row 3320)",
+          kind: "business",
+          checked: true,
+        }],
+      },
+    },
+    executionLog: [],
+  };
+  const verified = buildJobReport(common).join("\n");
+  assert.match(verified, /Bank Account PK35HABB0018067900476803 \(row 3320\) - the agent read it back \(read-only\) and it matches the approved figure/);
+  assert.doesNotMatch(verified, /Bank Account PK35HABB0018067900476803 \(row 3320\) - the agent could not check it/);
+  const legacy = structuredClone(common);
+  legacy.result.autofill.takenOver[0].checked = false;
+  const unchecked = buildJobReport(legacy).join("\n");
+  assert.match(unchecked, /Bank Account PK35HABB0018067900476803 \(row 3320\) - the agent could not check it/);
+});
+
+test("job report records the guarded Bank Profit Calculate action", () => {
+  const out = buildJobReport({
+    executionLog: [{ step: "bank_profit_calculated", detail: "verified" }],
+  }).join("\n");
+  assert.match(out, /Calculate: pressed only to refresh a verified Bank Profit derived Tax Chargeable cell/);
+  assert.match(out, /Submit, Prepare PSID, payment: never pressed/);
+});
+
 test("paused run: says where it stopped and why, including the income-source page", () => {
   const report = buildJobReport({
     finalStatus: "paused",
@@ -239,6 +275,22 @@ test("attention message: plain words, grouped by cause, no status codes", () => 
   assert.equal((out.text.match(/could not open this part/g) || []).length, 1, "one line per cause");
   assert.doesNotMatch(out.text, /wealth_|setup_failed|section_unavailable|gift_donor_not_resolved/, "no internal codes");
   assert.equal(buildAttentionMessage([{ irisCode: "1009", status: "filled" }]).itemCount, 0);
+});
+
+test("attention message: an unsafe Final Tax selection explains why Bank Profit was not added", () => {
+  const { buildAttentionMessage } = require("../electron-connect/job-report.js");
+  const out = buildAttentionMessage([
+    {
+      irisCode: "64040052",
+      label: "Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits",
+      status: "unverified_target",
+      setupStatus: "unexpected_sources_selected",
+      value: "45000",
+    },
+  ]);
+  assert.match(out.text, /Other Final Tax sources were selected/);
+  assert.match(out.text, /Deselect unrelated sources/);
+  assert.doesNotMatch(out.text, /unexpected_sources_selected|unverified_target/);
 });
 
 test("attention message: every status the row filler and the wealth driver can report has a plain sentence", () => {

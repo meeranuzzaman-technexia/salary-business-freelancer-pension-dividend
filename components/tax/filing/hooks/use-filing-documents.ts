@@ -1,4 +1,5 @@
 import { isBusinessPurchaseBasisField } from "@/lib/tax/business-schedule-fields";
+import { isBankProfitCertificate } from "@/lib/tax/bank-profit-document-slot";
 import { PENSION_LABELS, pensionFieldKey, type PensionReviewDecisionKey } from "@/lib/tax/pension-statement-fields";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -519,7 +520,7 @@ export function useFilingDocuments({
     const record = documentRecords[documentType];
     if (!record) return;
     if (
-      documentType === "pension_statement" &&
+      (documentType === "pension_statement" || isBankProfitCertificate(documentType)) &&
       record.extractionStatus === "MAPPED"
     ) {
       setDocumentRecords((previous) => ({
@@ -527,7 +528,9 @@ export function useFilingDocuments({
         [documentType]: { ...record, extractionStatus: "COMPLETED" },
       }));
       setProfileSyncNote(
-        "Unsaved pension changes: Save & Approve Map again before continuing. The previously approved source is not silently overwritten.",
+        isBankProfitCertificate(documentType)
+          ? "Unsaved bank-profit certificate changes: Save & Approve Map again before continuing. The prior approved projection is not silently overwritten."
+          : "Unsaved pension changes: Save & Approve Map again before continuing. The previously approved source is not silently overwritten.",
       );
       resetDownstreamSteps(step, true);
     }
@@ -553,9 +556,12 @@ export function useFilingDocuments({
       if (!field) return previous;
 
       const label = field.label.toLowerCase().replace(/[^a-z0-9]+/g, "_");
-      const nextValue = ["cnic_number", "cnic", "identity_number"].includes(
-        label,
-      )
+      const nextValue = [
+        "cnic_number",
+        "cnic",
+        "identity_number",
+        "taxpayer_cnic",
+      ].includes(label)
         ? formatCnicInput(value)
         : ["name", "full_name", "taxpayer_name"].includes(label)
           ? normalizeIdentityName(value)
@@ -580,7 +586,11 @@ export function useFilingDocuments({
             }
           : current,
       );
-      return { ...previous, [record.id]: { ...payload, fields } };
+      const nextPayload: ExtractedPayload = { ...payload, fields };
+      if (isBankProfitCertificate(documentType)) {
+        delete nextPayload.approvedBankProfitCertificate;
+      }
+      return { ...previous, [record.id]: nextPayload };
     });
   }
 
@@ -677,6 +687,17 @@ export function useFilingDocuments({
       ...previous,
       [documentType]: { ...record, extractionStatus: "COMPLETED" },
     }));
+    if (isBankProfitCertificate(documentType)) {
+      setExtractedByDocumentId((previous) => {
+        const payload = previous[record.id];
+        if (!payload) return previous;
+        const nextPayload = { ...payload };
+        delete nextPayload.approvedBankProfitCertificate;
+        return { ...previous, [record.id]: nextPayload };
+      });
+    }
+    if (documentType === "pension_statement" || isBankProfitCertificate(documentType))
+      resetDownstreamSteps(step, true);
   }
 
   async function handleRecoverBusinessPurchaseBasis(documentType: string) {
@@ -755,6 +776,22 @@ export function useFilingDocuments({
       return;
     }
 
+    if (isBankProfitCertificate(documentType)) {
+      setExtractedByDocumentId((previous) => {
+        const payload = previous[record.id];
+        if (!payload) return previous;
+        const nextPayload = { ...payload };
+        delete nextPayload.approvedBankProfitCertificate;
+        return { ...previous, [record.id]: nextPayload };
+      });
+    }
+    if (documentType === "pension_statement" || isBankProfitCertificate(documentType)) {
+      setDocumentRecords((previous) => ({
+        ...previous,
+        [documentType]: { ...record, extractionStatus: "COMPLETED" },
+      }));
+      resetDownstreamSteps(step, true);
+    }
     const result = await approveAndMapExtractedDocumentAction(record.id);
     setMappingDocumentId(null);
     void recordDocumentLifecycle({
@@ -774,14 +811,32 @@ export function useFilingDocuments({
     }
 
     setProfileSyncNote(
-      describeCnicProfilePlan(
-        (
-          result as {
-            profilePlan?: { filled?: string[]; skipped?: { field: string }[] };
-          }
-        ).profilePlan,
-      ),
+      result.mapping === "BANK_PROFIT_CERTIFICATE"
+        ? "Bank-profit certificate fields are approved and saved as canonical evidence. The printed section, rate and ATL status are not converted into a legal tax treatment; reconcile them before calculation/portal entry."
+        : describeCnicProfilePlan(
+            (
+              result as {
+                profilePlan?: { filled?: string[]; skipped?: { field: string }[] };
+              }
+            ).profilePlan,
+          ),
     );
+    if (
+      result.mapping === "BANK_PROFIT_CERTIFICATE" &&
+      "certificate" in result
+    ) {
+      setExtractedByDocumentId((previous) => {
+        const payload = previous[record.id];
+        if (!payload) return previous;
+        return {
+          ...previous,
+          [record.id]: {
+            ...payload,
+            approvedBankProfitCertificate: result.certificate,
+          },
+        };
+      });
+    }
     if (result.mapping === "CNIC" && typeof window !== "undefined") {
       window.dispatchEvent(new Event("taxrocket-profile-updated"));
     }

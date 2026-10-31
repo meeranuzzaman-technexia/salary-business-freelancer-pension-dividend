@@ -35,6 +35,21 @@ function sourceLabel(source: string) {
   return SOURCE_LABELS[source] ?? source.replaceAll("_", " ");
 }
 
+// Distinguishable Bank Profit categories are named on the review line itself
+// (a filing can hold several Bank Profit lines side by side).
+const BANK_PROFIT_CATEGORY_LABELS: Record<string, string> = {
+  "bank-or-financial-institution-deposit": "Bank account / deposit",
+  "government-securities-non-individual": "Government securities",
+  "other-profit-on-debt": "Other profit on debt",
+  "sukuk-company": "Sukuk — company",
+  "sukuk-individual-aop-above-1m": "Sukuk — individual/AOP above PKR 1M",
+  "sukuk-individual-aop-below-1m": "Sukuk — individual/AOP up to PKR 1M",
+};
+
+function bankProfitCategoryLabel(subcategory: string) {
+  return BANK_PROFIT_CATEGORY_LABELS[subcategory] ?? subcategory.replaceAll("-", " ");
+}
+
 type WizardReviewStepProps = Readonly<{
   filingSummary: FilingSummary | null;
   filingSummaryError: string | null;
@@ -292,7 +307,9 @@ export function WizardReviewStep({
                 const title =
                   line.source === "combined_slab" && parts.length === 1
                     ? sourceLabel(parts[0].route)
-                    : (line.subcategoryLabel ?? sourceLabel(line.source));
+                    : line.source === "bank_profit" && line.subcategory
+                      ? `${sourceLabel(line.source)} — ${bankProfitCategoryLabel(line.subcategory)}`
+                      : (line.subcategoryLabel ?? sourceLabel(line.source));
                 return (
                   <li
                     key={`${line.source}-${line.ruleId}`}

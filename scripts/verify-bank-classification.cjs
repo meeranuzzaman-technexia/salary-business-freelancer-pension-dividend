@@ -162,12 +162,36 @@ test("dividend: auto-approve is gated — source selected + rule re-verified", (
     ),
     "a DIVIDEND row is bulk-safe only when the source is selected AND the deterministic rule reproduces it",
   );
-  // the salary/pension whitelist must stay tight — dividend rides its own branch
+  // the salary/pension whitelist must stay tight — bank profit joins it per
+  // the TR-BankProfit port; dividend still rides its own gated branch
   assert.ok(
-    /\["SALARY", "PENSION"\]\.includes/.test(autoFn),
-    "the SALARY/PENSION bulk-safe whitelist must remain intact",
+    /\["SALARY", "PENSION", "BANK_PROFIT"\]\.includes/.test(autoFn),
+    "the SALARY/PENSION bulk-safe whitelist must remain intact (plus BANK_PROFIT per port)",
   );
 });
+
+test("Approve All Safe includes explicitly classified Bank Profit income", () => {
+  const actions = fs.readFileSync(
+    path.join(root, "app/actions/bank-classification.ts"),
+    "utf8",
+  );
+  assert.match(actions, /\["SALARY", "PENSION", "BANK_PROFIT"\]\.includes/);
+  assert.match(
+    actions,
+    /classificationStatus:\s*\{\s*in:\s*\["SUGGESTED", "POTENTIAL_INCOME"\]/,
+  );
+  const ui = fs.readFileSync(
+    path.join(root, "components/tax/filing/wizard-bank-intelligence-step.tsx"),
+    "utf8",
+  );
+  const buttonGate = ui.slice(
+    ui.indexOf("{selectedRows.some("),
+    ui.indexOf("Approve All Safe Transactions"),
+  );
+  assert.match(buttonGate, /row\.classificationStatus === "POTENTIAL_INCOME"/);
+  assert.match(buttonGate, /row\.suggestedCategory === "BANK_PROFIT"/);
+});
+
 
 test("matcher: unit behaviour", () => {
   const m = matching.bankDescriptionMatchesKeyword;

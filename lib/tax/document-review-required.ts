@@ -12,6 +12,11 @@ import {
   isBankStatementIbanLabel,
   validateBankStatementIban,
 } from "./bank-statement-fields";
+import {
+  BANK_PROFIT_CERTIFICATE_FIELD_DEFINITIONS,
+  getBankProfitCertificateReviewErrors,
+  isBankProfitCertificateFieldRequired,
+} from "./bank-profit-certificate-fields";
 
 type Field = { label?: unknown; value?: unknown; confidence?: unknown };
 type Requirement = {
@@ -101,6 +106,11 @@ const REQUIREMENTS: Record<string, Requirement[]> = {
     },
     { label: "Currency", kind: "currency" },
   ],
+  bank_certificate: BANK_PROFIT_CERTIFICATE_FIELD_DEFINITIONS.map((field) => ({
+    label: field.label,
+    aliases: [...field.aliases],
+    ...(field.validationKind ? { kind: field.validationKind } : {}),
+  })),
   business_books: [
     { label: "Business Name" },
     { label: "Tax Year", kind: "year" },
@@ -245,6 +255,8 @@ export function isDocumentReviewRequiredField(
   )
     return true;
   if (documentType === "pension_statement") return isPensionStatementRequiredField(label, fields);
+  if (documentType === "bank_certificate")
+    return isBankProfitCertificateFieldRequired(label, fields);
   return documentType === "salary_certificate"
     ? isSalaryCertificateRequiredField(String(label ?? ""))
     : Boolean(documentReviewFieldRequirement(documentType, label));
@@ -276,6 +288,8 @@ export function getDocumentReviewRequiredErrors(
   taxYear?: number,
 ): string[] {
   if (documentType === "pension_statement") return getPensionStatementReviewErrors(fields, taxYear);
+  if (documentType === "bank_certificate")
+    return getBankProfitCertificateReviewErrors(fields, taxYear);
   const errors: string[] = [];
   const requirements: Requirement[] = [...(REQUIREMENTS[documentType] ?? [])];
   if (

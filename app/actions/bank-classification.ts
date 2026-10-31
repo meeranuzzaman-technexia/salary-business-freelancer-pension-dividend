@@ -765,7 +765,7 @@ export async function autoReviewSafeBankTransactionsAction(
         filingDraftId: draft.id,
         userId: draft.userId,
         bankAccountId: account.id,
-        classificationStatus: "SUGGESTED",
+        classificationStatus: { in: ["SUGGESTED", "POTENTIAL_INCOME"] },
         suggestedEntryType: { not: null },
         suggestedCategory: { not: null },
       },
@@ -776,6 +776,7 @@ export async function autoReviewSafeBankTransactionsAction(
         description: true,
         debit: true,
         credit: true,
+        classificationStatus: true,
         suggestedEntryType: true,
         suggestedCategory: true,
       },
@@ -798,6 +799,12 @@ export async function autoReviewSafeBankTransactionsAction(
       .filter((transaction) => !heldBackAsTransfers.has(transaction.id))
       .filter(
         (transaction) =>
+          transaction.classificationStatus === "SUGGESTED" ||
+          (transaction.classificationStatus === "POTENTIAL_INCOME" &&
+            transaction.suggestedCategory === "BANK_PROFIT"),
+      )
+      .filter(
+        (transaction) =>
           !bankEntryDirectionError(transaction, transaction.suggestedEntryType),
       )
       .filter(
@@ -806,11 +813,14 @@ export async function autoReviewSafeBankTransactionsAction(
             safeExpenseCategories.includes(
               transaction.suggestedCategory ?? "",
             )) ||
+          // Only the narrow safe-income categories are batch-approved; the
+          // status filter above admits AI potential income for Bank Profit only.
           (transaction.suggestedEntryType === "INCOME" &&
             // Pension payouts are as recognisable as payroll (same keyword
             // rule family), so a rule-matched PENSION suggestion is bulk-safe
-            // exactly like SALARY. All other income stays manual.
-            ["SALARY", "PENSION"].includes(
+            // exactly like SALARY; §151 bank-profit credits are the same
+            // keyword family (TR-BankProfit port). All other income stays manual.
+            ["SALARY", "PENSION", "BANK_PROFIT"].includes(
               transaction.suggestedCategory ?? "",
             )) ||
           // Dividend narrations are as self-identifying as payroll

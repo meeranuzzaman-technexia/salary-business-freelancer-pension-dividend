@@ -79,7 +79,31 @@ const { validateFilingCompleteness } = require(
   path.join(root, "lib/tax/filing-completeness.ts"),
 );
 
-function fakeDb({ accounts, transactions = [] }) {
+const bankProfitCertificateFields = [
+  { label: "Tax Year", value: 2026 },
+  { label: "Reporting Period Start", value: "2025-07-01" },
+  { label: "Reporting Period End", value: "2026-06-30" },
+  { label: "Bank / Financial Institution Name", value: "SCB" },
+  { label: "Bank NTN", value: "1234567" },
+  { label: "Taxpayer Name", value: "Example Taxpayer" },
+  { label: "Taxpayer CNIC", value: "4210112345678" },
+  { label: "Account Number", value: "123456789" },
+  { label: "Instrument / Category", value: "Term Deposit" },
+  { label: "Printed Section / Subsection", value: "Section 151(1)(b)" },
+  { label: "Gross Annual Profit / Yield", value: 100 },
+  { label: "Tax Deducted / Withheld", value: 15 },
+  { label: "Bank-applied Withholding Rate (%)", value: "15%" },
+  { label: "ATL / Non-ATL Status", value: "ATL" },
+  { label: "Net Profit Credited", value: 85 },
+  { label: "Currency", value: "PKR" },
+];
+
+function fakeDb({
+  accounts,
+  transactions = [],
+  bankCertificateStatus = "MAPPED",
+  bankCertificateFields = bankProfitCertificateFields,
+}) {
   const doc = (a) => ({
     id: `doc-${a.id}`,
     documentType: "bank_statement",
@@ -118,7 +142,8 @@ function fakeDb({ accounts, transactions = [] }) {
           id: "doc-cert",
           documentType: "bank_certificate",
           bankAccountId: null,
-          extractionStatus: "MAPPED",
+          extractionStatus: bankCertificateStatus,
+          extractedData: JSON.stringify({ fields: bankCertificateFields }),
         },
       ],
     },
@@ -189,6 +214,29 @@ test("gate: IBAN present, statement and transactions present -> no IBAN/transact
     fakeDb({ accounts: [account()], transactions: [txn()] }),
   );
   assert.deepEqual(blockers, []);
+});
+
+test("gate: bank profit certificate must be mapped and its gross/net values reconciled", async () => {
+  const unmapped = await blockersFor(
+    fakeDb({ accounts: [], bankCertificateStatus: "COMPLETED" }),
+  );
+  assert.ok(
+    unmapped.some((blocker) => blocker.includes("Review and approve/map the required bank_certificate document")),
+    JSON.stringify(unmapped),
+  );
+
+  const unreconciled = await blockersFor(
+    fakeDb({
+      accounts: [],
+      bankCertificateFields: bankProfitCertificateFields.map((field) =>
+        field.label === "Net Profit Credited" ? { ...field, value: 84 } : field,
+      ),
+    }),
+  );
+  assert.ok(
+    unreconciled.some((blocker) => blocker.includes("must equal Net Profit Credited")),
+    JSON.stringify(unreconciled),
+  );
 });
 
 // --- packet ------------------------------------------------------------------

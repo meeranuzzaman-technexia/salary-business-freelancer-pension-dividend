@@ -75,6 +75,15 @@ const {
 const TAX_DEDUCTION_GRID_BY_CODE = Object.freeze({
   "64020004": "Adjustable Tax",
   "64020007": "Final Tax",
+  // Bank Profit u/s 151 rows enter the Other Sources > Tax Deductions >
+  // Final Tax accordion through the verified absent-row route (row created by
+  // the Bank Profit row driver at fill time, 2026-10-23 live captures).
+  "64040052": "Final Tax",
+  "64040053": "Final Tax",
+  "64040054": "Final Tax",
+  "64330054": "Final Tax",
+  "64330055": "Final Tax",
+  "64330056": "Final Tax",
   // §150 dividend rows, Other Sources > Tax Deductions > Final Tax
   // (2026-10-26 live captures; verified writeable [Taxable Amount, Tax Deducted]).
   "64030052": "Final Tax",
@@ -186,6 +195,7 @@ function resolveAutofillMode(jobContext) {
 // Independent controller stamp: a new navigator must not make an OLD main
 // process appear fully updated (the mixed fix10/fix11 rollout hid this).
 const irisBusinessRowDriver = require("./iris-business-row-driver");
+const irisBankProfitRowDriver = require("./iris-bank-profit-row-driver");
 // Phase 1 (fix46): read-only census tour of every IRIS tab (tracking + A6).
 const irisTourCensus = require("./iris-tour-census");
 // Phase 2 (fix47): the ONE end-of-run Save (taxpayer decision Q1).
@@ -205,7 +215,7 @@ const irisComputationsDriver = require("./iris-computations-driver");
 const irisTurnoverDriver = require("./iris-turnover-driver");
 const AGENT_BUILD_TAG = "pension-merge-20261023";
 function getAgentBuildLabel() {
-  return `${AGENT_BUILD_TAG} | navigator: ${irisNavigation.BUILD_TAG} | filler: ${irisRowFiller.BUILD_TAG} | pension: ${PENSION_GUARD_BUILD_TAG}`;
+  return `${AGENT_BUILD_TAG} | navigator: ${irisNavigation.BUILD_TAG} | filler: ${irisRowFiller.BUILD_TAG} | bank-profit-row: ${irisBankProfitRowDriver.BUILD_TAG} | pension: ${PENSION_GUARD_BUILD_TAG}`;
 }
 function assertNavigatorBuild() {
   const mismatched = [
@@ -217,6 +227,7 @@ function assertNavigatorBuild() {
     ["iris-employer-driver.js", irisEmployerDriver.BUILD_TAG],
     ["job-report.js", JOB_REPORT_BUILD_TAG],
     ["iris-business-row-driver.js", irisBusinessRowDriver.BUILD_TAG],
+    ["iris-bank-profit-row-driver.js", irisBankProfitRowDriver.BUILD_TAG],
     ["iris-tour-census.js", irisTourCensus.BUILD_TAG],
     ["iris-save-draft.js", irisSaveDraft.BUILD_TAG],
     ["iris-depreciation-driver.js", irisDepreciationDriver.BUILD_TAG],
@@ -3846,6 +3857,14 @@ async function runLocalIrisNavigationCheck(jobContext, job) {
     snapshot.otherSources?.taxDeductions?.version === "dividend-final-tax-v1" &&
     Array.isArray(snapshot.otherSources?.taxDeductions?.agentFields) &&
     snapshot.otherSources.taxDeductions.agentFields.length > 0;
+  const packetFields = Array.isArray(snapshot.portalFieldMap)
+    ? snapshot.portalFieldMap
+    : Array.isArray(snapshot.portalFieldMap?.adjustableTaxFields)
+      ? snapshot.portalFieldMap.adjustableTaxFields
+      : [];
+  const bankProfitRequested = packetFields.some(
+    (field) => irisBankProfitRowDriver.BANK_PROFIT_CODES.includes(String(field?.irisCode || "").trim()),
+  );
   // Dividend-only filing (no salary/pension/business): the Employment panel
   // never renders for this return, so the legacy "default salary" tour hangs
   // on expand-employment. Verified live 2026-10-26 (portal_fields_unverified,
@@ -3856,19 +3875,48 @@ async function runLocalIrisNavigationCheck(jobContext, job) {
     !hasBusiness &&
     !incomeSources.includes("salary") &&
     !incomeSources.includes("pension");
-  const salaryTourRequested = salaryRequested && !dividendOnlyRoute;
-  const packetFields = Array.isArray(snapshot.portalFieldMap)
-    ? snapshot.portalFieldMap
-    : Array.isArray(snapshot.portalFieldMap?.adjustableTaxFields)
-      ? snapshot.portalFieldMap.adjustableTaxFields
-      : [];
+  // Bank Profit lives in Other Sources > Tax Deductions > Final Tax — the
+  // exact same Employment-less return shape as dividend-only. A
+  // bank-profit-only filing must therefore not fall back to the salary tour
+  // either (verified live 2026-10-28: portal_fields_unverified, expand-
+  // employment timeout, employmentPanelCount: 0 on a bank-profit return).
+  const bankProfitOnlyRoute =
+    bankProfitRequested &&
+    !dividendOnlyRoute &&
+    !hasBusiness &&
+    !incomeSources.includes("salary") &&
+    !incomeSources.includes("pension");
+  const salaryTourRequested =
+    salaryRequested && !dividendOnlyRoute && !bankProfitOnlyRoute;
   // The pension Section 4AB surcharge (923184) is the only non-business
   // Computations write; include that section only when the approved packet
   // actually queues it, so salary/business tours are unchanged.
   const computationsRequested = packetFields.some(
     (field) => String(field?.irisCode || "") === "923184",
   );
-  const handoffSectionIds = [...(salaryTourRequested ? irisNavigation.SALARY_WITHHOLDING_SECTION_IDS : []), ...businessSections, ...(dividendTaxDeductionRequested ? ["other_sources_tax_deductions"] : []), ...(computationsRequested ? ["computations"] : [])];
+  const bankProfitFields = packetFields.filter((field) =>
+    irisBankProfitRowDriver.BANK_PROFIT_CODES.includes(String(field?.irisCode || "").trim()),
+  );
+  const bankProfitDetailsByCode = new Map();
+  for (const field of bankProfitFields) {
+    const code = String(field.irisCode || "").trim();
+    const details = bankProfitDetailsByCode.get(code) || { investments: new Set(), contents: new Set(), missing: false };
+    if (!field.bankProfitInvestment || !field.bankProfitContents) details.missing = true;
+    if (field.bankProfitInvestment) details.investments.add(field.bankProfitInvestment);
+    if (field.bankProfitContents) details.contents.add(field.bankProfitContents);
+    bankProfitDetailsByCode.set(code, details);
+  }
+  if (
+    bankProfitFields.length &&
+    Array.from(bankProfitDetailsByCode.values()).some(
+      (details) => details.missing || details.investments.size !== 1 || details.contents.size !== 1,
+    )
+  ) {
+    const message = "This Bank Profit packet predates the verified category-detail workflow. Generate and approve a fresh packet so its certificate Investment and Contents can be entered. Nothing was changed in FBR.";
+    return { paused: true, pauseAction: "portal_state_confirmation", pauseMessage: message,
+      executionLog: [], result: { requiredAction: "portal_state_confirmation", message, submitted: false, bankProfitCoverage: "missing_detail_payload" } };
+  }
+  const handoffSectionIds = Array.from(new Set([...(salaryTourRequested ? irisNavigation.SALARY_WITHHOLDING_SECTION_IDS : []), ...businessSections, ...(dividendTaxDeductionRequested ? ["other_sources_tax_deductions"] : []), ...(bankProfitRequested ? ["other_sources_tax_deductions"] : []), ...(computationsRequested ? ["computations"] : [])]));
   if (!handoffSectionIds.length) {
     const message = servicesRoute.active
       ? "Freelancer / Services is selected, but no verified Business target is queued for IRIS. Review the packet's evidence gaps, regenerate and approve it if needed, then retry. The agent will not substitute Salary; nothing was changed in FBR."
@@ -4501,7 +4549,41 @@ async function runRealIrisAutofill(jobContext, job, mode) {
     Number(packet.taxYear || snapshot.filing?.taxYear) || undefined;
   const taxpayerIdentifier = launchState.accountReference || "";
 
+  // 3320/3304/3301/3302 are special Balance Sheet child rows. They are not
+  // ordinary grid fields and are deliberately placed later by DP-2. Keep their
+  // exact planned identities available to the generic prefill scan so it does
+  // not mislabel a planned bank/vehicle/property child as an unplanned row.
+  // A code alone is never enough: another account or vehicle under the same
+  // summary code must remain visible as an unexpected prefill.
+  const balancePlan =
+    ["business-entry-v4", "business-entry-v5", "business-entry-v6", "business-entry-v7", "business-entry-v8"].includes(snapshot.business?.version) &&
+    Array.isArray(snapshot.business?.balanceDetails?.agentFields)
+      ? snapshot.business.balanceDetails
+      : null;
+  const balancePrefillText = (value) =>
+    String(value == null ? "" : value).replace(/\s+/g, " ").trim().toLowerCase();
+  const balancePrefillKey = (row) =>
+    `${String(row?.code || "").trim()}|${balancePrefillText(row?.description)}`;
+  const exactPlannedBalanceChildKeys = (rows) => {
+    const keys = new Set();
+    for (const field of balancePlan?.agentFields || []) {
+      const code = String(field?.irisCode || "").trim();
+      const prefix = balancePrefillText(field?.rowDescriptionIncludes);
+      if (!code || !prefix) continue;
+      const matches = (rows || []).filter(
+        (row) =>
+          String(row?.code || "").trim() === code &&
+          balancePrefillText(row?.description).includes(prefix),
+      );
+      // A duplicate exact child is an ambiguity, not a harmless prefill; leave
+      // it visible to the review flow and let the balance driver refuse it.
+      if (matches.length === 1) keys.add(balancePrefillKey(matches[0]));
+    }
+    return keys;
+  };
+
   let results = [];
+  let bankProfitCalculated = false;
   const unexpectedPrefill = [];
   // Phase 1 (fix46): the agent no longer stops at the first figure it cannot
   // enter; it records the problem on that figure and carries on (see the stop
@@ -4744,6 +4826,13 @@ async function runRealIrisAutofill(jobContext, job, mode) {
     const passNote = pass > 1 ? " (second pass)" : "";
     const isServicesTaxDeductionGroup =
       servicesRouteActive && group.sectionId === "business_tax_deduction";
+    const isBankProfitFinalTaxGroup =
+      group.sectionId === "other_sources_tax_deductions" &&
+      group.fields.length > 0 &&
+      group.fields.every((field) =>
+        irisBankProfitRowDriver.BANK_PROFIT_CODES.includes(String(field.irisCode || "").trim()),
+      ) &&
+      new Set(group.fields.map((field) => String(field.irisCode || "").trim())).size === 1;
     if (
       servicesRouteActive &&
       !["business_other_revenues", "business_tax_deduction"].includes(group.sectionId)
@@ -4815,10 +4904,22 @@ async function runRealIrisAutofill(jobContext, job, mode) {
       sectionId: group.sectionId,
       taxYear,
       taxpayerIdentifier,
-      requiredGridTitle: isTaxDeductionGroup ? taxDeductionGridTitles[0] : null,
-      requiredRowCodes: isTaxDeductionGroup
-        ? group.fields.map((field) => field.irisCode)
-        : [],
+      // Bank Profit Final Tax rows route through their separately verified
+      // absent-row route (the packet code is CREATED later by the row driver),
+      // so the navigation contract names the exact grid here. This pins the
+      // target AND — as in the standalone bank-profit agent — forces the
+      // Final Tax accordion to be re-expanded before the row driver inspects
+      // it, because a census pass in between collapses the grid again.
+      requiredGridTitle: isBankProfitFinalTaxGroup
+        ? "Final Tax"
+        : isTaxDeductionGroup
+          ? taxDeductionGridTitles[0]
+          : null,
+      requiredRowCodes: isBankProfitFinalTaxGroup
+        ? []
+        : isTaxDeductionGroup
+          ? group.fields.map((field) => field.irisCode)
+          : [],
     });
     if (!moved.ok) {
       onStep(
@@ -4930,6 +5031,61 @@ async function runRealIrisAutofill(jobContext, job, mode) {
     let sectionVerified = isServicesTaxDeductionGroup
       ? moved.ok && moved.status === "grid_ready"
       : Boolean(sectionTour?.sections?.find(entry => entry?.id === group.sectionId)?.mappingVerified);
+    if (isBankProfitFinalTaxGroup) {
+      const investments = Array.from(
+        new Set(group.fields.map((field) => field.bankProfitInvestment).filter(Boolean)),
+      );
+      const contents = Array.from(
+        new Set(group.fields.map((field) => field.bankProfitContents).filter(Boolean)),
+      );
+      const bankProfitCode = String(group.fields[0]?.irisCode || "").trim();
+      const addIfMissing = group.fields.some((field) => {
+        const taken =
+          takenKeys.has(autofillItemKey(field)) &&
+          field.replaceOnlyIfExisting === undefined &&
+          String(field.irisCode || "") !== "923184";
+        return !taken;
+      });
+      let setup;
+      try {
+        setup = await irisBankProfitRowDriver.ensureBankProfitFinalTaxRow(
+          windowInstance,
+          {
+            mode,
+            code: bankProfitCode,
+            addIfMissing,
+            investment: investments.length === 1 ? investments[0] : "",
+            contents: contents.length === 1 ? contents[0] : "",
+            beforeStep: censusGuard,
+            onStep,
+          },
+        );
+      } catch (error) {
+        setup = {
+          ok: false,
+          status: "driver_error",
+          message: `Bank Profit Final Tax row setup failed (${error?.message || error}); no value was typed.${passNote}`,
+        };
+      }
+      if (!setup.ok) {
+        onStep("real_autofill_bank_profit_row_setup_failed", setup.message);
+        const rowStatus = ["row_missing_dry", "row_missing_verify_only"].includes(setup.status)
+          ? irisRowFiller.FILL_STATUS.ROW_NOT_FOUND
+          : irisRowFiller.FILL_STATUS.UNVERIFIED_TARGET;
+        if (stopOnProblem) stopped = true;
+        return group.fields.map((field) => ({
+          ...field,
+          status: rowStatus,
+          sectionId: group.sectionId,
+          sectionStatus: setup.status,
+          setupStatus: setup.status,
+        }));
+      }
+      // The section navigator proved the Other Sources / Final Tax panel. The
+      // dedicated driver then verified the exact category parent/detail pair,
+      // headings and writable child inputs before any amount can be filled.
+      sectionVerified = true;
+    }
     let readiness = null;
     if (mode !== "dry" && (isBusinessGroup || isServicesTaxDeductionGroup)) {
       readiness = await waitForGroupReady({
@@ -4957,10 +5113,27 @@ async function runRealIrisAutofill(jobContext, job, mode) {
     // that draft clean.
     try {
       const rowsSeen = await irisRowFiller.snapshotIrisRows(windowInstance);
-      const unexpected = irisRowFiller.findUnexpectedPrefill(
-        rowsSeen,
-        group.fields.map((field) => field.irisCode),
-      );
+      const plannedBalanceChildren =
+        group.sectionId === irisBalanceSheetDriver.SECTION_ID
+          ? exactPlannedBalanceChildKeys(rowsSeen)
+          : new Set();
+      const unexpected = irisRowFiller
+        .findUnexpectedPrefill(
+          rowsSeen,
+          group.fields.map((field) => field.irisCode),
+        )
+        // Exact planned special child rows (bank, vehicle, property) are
+        // handled by DP-2 below. Do not suppress another child merely because
+        // it shares the same 3320/3304/3301/3302 summary code.
+        .filter((row) => !plannedBalanceChildren.has(balancePrefillKey(row)))
+        // Other supported profit categories are independent Final Tax rows.
+        .filter(
+          (row) =>
+            !isBankProfitFinalTaxGroup ||
+            !irisBankProfitRowDriver.BANK_PROFIT_CODES.includes(
+              String(row.code || "").trim(),
+            ),
+        );
       onStep(
         "real_autofill_prefill_snapshot",
         `${group.sectionId}: ${rowsSeen.length} row(s) read, ${unexpected.length} unexpected pre-filled row(s).${passNote}`,
@@ -5086,6 +5259,63 @@ async function runRealIrisAutofill(jobContext, job, mode) {
           outcome.results = retried.results;
         } else outcome.results[0].sectionStatus = ready.status;
       }
+      // Sukuk Final Tax rows derive Tax Chargeable from the other two cells:
+      // IRIS locks it, so press Calculate once and re-attempt the exact value.
+      if (
+        mode !== "dry" &&
+        isBankProfitFinalTaxGroup &&
+        irisBankProfitRowDriver.SUKUK_CODES.includes(String(field.irisCode || "").trim()) &&
+        field.column === "Tax Chargeable" &&
+        outcome.results.length === 1 &&
+        [irisRowFiller.FILL_STATUS.NO_EDITABLE_CELL, irisRowFiller.FILL_STATUS.COLUMN_DISABLED].includes(
+          outcome.results[0].status,
+        )
+      ) {
+        const calculated = await irisBankProfitRowDriver.calculateBankProfitFinalTax(
+          windowInstance,
+          {
+            mode,
+            code: field.irisCode,
+            expectedChargeable: field.value,
+            beforeStep: censusGuard,
+            onStep,
+          },
+        );
+        if (calculated.ok) {
+          bankProfitCalculated ||= calculated.status === "calculated";
+          const retried = await irisRowFiller.fillIrisRows(windowInstance, [field], {
+            dryRun: taken,
+            sectionVerified: true,
+          });
+          const retriedEntry = retried.results[0];
+          if (
+            retriedEntry &&
+            retriedEntry.status === irisRowFiller.FILL_STATUS.COLUMN_DISABLED &&
+            ["calculated", "already_calculated"].includes(calculated.status)
+          ) {
+            // The driver's post-Calculate readback already proved the derived
+            // cell holds the packet figure; the filler can only ever refuse a
+            // locked cell, so carry the verified readback as the outcome.
+            outcome.results = [
+              {
+                ...retriedEntry,
+                status: irisRowFiller.FILL_STATUS.ALREADY_CORRECT,
+                existingValue: String(field.value ?? ""),
+                plannedValue: String(field.value ?? ""),
+                dryRun: false,
+              },
+            ];
+          } else {
+            outcome.results = retried.results;
+          }
+        } else {
+          outcome.results[0].sectionStatus = calculated.status;
+          onStep(
+            "bank_profit_calculate_held",
+            `${field.irisCode} Calculate/recheck was held (${calculated.status}); Save and Submit were not used.`,
+          );
+        }
+      }
       const entries = outcome.results.map((entry) => ({
         ...(taken ? checkTakenOverEntry(entry) : entry),
         sourceGroup: field.sourceGroup,
@@ -5107,7 +5337,29 @@ async function runRealIrisAutofill(jobContext, job, mode) {
     }
     return out;
   };
-  for (const group of plan.groups) {
+  // A Bank Profit packet that carries several IRIS codes (e.g. Bank Profit and
+  // Sukuk) needs one navigation/row-setup pass per code: the dedicated row
+  // driver verifies the exact category pair before any amount is typed.
+  const executionGroups = plan.groups.flatMap((group) => {
+    if (group.sectionId !== "other_sources_tax_deductions") return [group];
+    const bankProfitCodes = new Set(
+      group.fields
+        .map((field) => String(field.irisCode || "").trim())
+        .filter((code) => irisBankProfitRowDriver.BANK_PROFIT_CODES.includes(code)),
+    );
+    if (bankProfitCodes.size <= 1) return [group];
+    const nonBankProfitFields = group.fields.filter(
+      (field) => !irisBankProfitRowDriver.BANK_PROFIT_CODES.includes(String(field.irisCode || "").trim()),
+    );
+    return [
+      ...Array.from(bankProfitCodes).map((code) => ({
+        ...group,
+        fields: group.fields.filter((field) => String(field.irisCode || "").trim() === code),
+      })),
+      ...(nonBankProfitFields.length ? [{ ...group, fields: nonBankProfitFields }] : []),
+    ];
+  });
+  for (const group of executionGroups) {
     if (stopped) break;
     results = results.concat(await fillGroup(group, 1));
   }
@@ -5144,7 +5396,7 @@ async function runRealIrisAutofill(jobContext, job, mode) {
       "real_autofill_second_pass",
       `Second pass: ${retryKeys.size} business figure(s) IRIS did not let the agent type in the first pass (locked/loading grid, section or picker not ready) are tried once more.`,
     );
-    for (const group of plan.groups) {
+    for (const group of executionGroups) {
       if (stopped) break;
       const fields = group.fields.filter((field) => retryKeys.has(autofillItemKey(field)));
       if (!fields.length) continue;
@@ -5276,11 +5528,6 @@ async function runRealIrisAutofill(jobContext, job, mode) {
   // rows (live) through the capture-proven click surface only, then types the
   // amounts through the same verified row filler (readback, overwrite guard).
   // A row it cannot create is reported on that item.
-  const balancePlan =
-    ["business-entry-v4", "business-entry-v5", "business-entry-v6", "business-entry-v7", "business-entry-v8"].includes(snapshot.business?.version) &&
-    Array.isArray(snapshot.business?.balanceDetails?.agentFields)
-      ? snapshot.business.balanceDetails
-      : null;
   if (balancePlan && balancePlan.agentFields.length) {
     if (stopped) {
       onStep(
@@ -5312,6 +5559,11 @@ async function runRealIrisAutofill(jobContext, job, mode) {
                 dryRun: Boolean(opts && opts.dryRun),
                 sectionVerified: true,
               }),
+            // A taxpayer-confirmed 3320/3304/property child must be checked
+            // read-only. The balance driver must not open its ADD dialog or
+            // type a replacement if that child is missing.
+            verifyOnly: (field) => takenKeys.has(autofillItemKey(field)),
+            checkEntry: checkTakenOverEntry,
             beforeStep: () =>
               ensureNavigationJobActive(
                 job.id,
@@ -6184,7 +6436,7 @@ async function runRealIrisAutofill(jobContext, job, mode) {
   if (mode === "live" && !autofillReviewRequired && job?.type === "tax_assisted_filing") {
     onStep(
       "autofill_handoff_complete",
-      `Approved field entry completed. Review the return in FBR and submit it yourself; no extra TaxRocket confirmation is required. ${nothingDone}${saveNote}`,
+      `Approved field entry completed. Review the return in FBR and submit it yourself; no extra TaxRocket confirmation is required. ${nothingDone}${saveNote}${bankProfitCalculated ? " Calculate was used only to refresh and verify Bank Profit Tax Chargeable." : ""}`,
     );
   }
   // What the taxpayer reads is plain language (one line per cause). The raw
@@ -6371,6 +6623,7 @@ async function runRealIrisAutofill(jobContext, job, mode) {
       mode,
       summary,
       results,
+      bankProfitCalculated,
       captures,
       message: fillMessage,
       wealthPrepared: wealthPrepared.map((f) => {
@@ -6678,9 +6931,11 @@ function checkTakenOverEntry(entry) {
       ? "empty"
       : status === "overwrite_needs_confirmation"
         ? "value_differs"
-        : status === "row_not_found" || status === "wealth_row_missing_dry_run"
+        : status === "row_not_found" ||
+            status === "wealth_row_missing_dry_run" ||
+            status === "balance_row_missing_dry_run"
           ? "row_missing"
-          : status === "ambiguous_row"
+          : status === "ambiguous_row" || status === "balance_row_ambiguous"
             ? "ambiguous"
             : "unreadable";
   return {

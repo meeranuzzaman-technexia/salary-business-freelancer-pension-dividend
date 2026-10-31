@@ -148,7 +148,7 @@ test("map: Save & Approve Map runs the same required check before reading the sh
   assert.ok(start > 0);
   const body = action.slice(start, action.indexOf('if (document.documentType === "bank_statement")', start));
   assert.match(body, /"business_balance_sheet",/);
-  assert.match(body, /getDocumentReviewRequiredErrors\(\s*document\.documentType,\s*fields,\s*reviewDraft\.taxYear,?\s*\)/);
+  assert.match(body, /getDocumentReviewRequiredErrors\(\s*(?:baseFilingDocumentType\()?\s*document\.documentType,?\s*\)?,\s*fields,\s*reviewDraft\.taxYear,?\s*\)/);
   assert.match(body, /if \(requiredErrors\.length\)\s*return \{ success: false, error: requiredErrors\.join\(" "\) \}/);
   // The reviewed sheet then reads without pending breakdown gaps.
   const sheet = business.readBusinessBalanceSheet({ fields: fieldsOf(A) }, 2026);

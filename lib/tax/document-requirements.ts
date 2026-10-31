@@ -62,7 +62,8 @@ const DOC_MAP: Record<
     {
       documentType: "bank_certificate",
       label: "Bank Profit Certificate",
-      reason: "Required for bank profit income.",
+      reason:
+        "Required for bank-profit income: review the printed period, gross profit, withholding, section/rate/status and net-credit reconciliation before approval.",
     },
   ],
   dividend: [

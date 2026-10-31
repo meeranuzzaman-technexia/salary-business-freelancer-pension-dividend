@@ -234,6 +234,7 @@ export async function getFilingSummaryAction(draftId: string) {
 
       return {
         source: line.source,
+        subcategory: line.subcategory,
         subcategoryLabel,
         section: line.section,
         ruleId: line.ruleId,

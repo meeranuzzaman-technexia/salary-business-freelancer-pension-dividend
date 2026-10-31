@@ -23,6 +23,19 @@ import {
   readBusinessBooksAnnual,
 } from "@/lib/tax/business-schedule-fields";
 import {
+  ensureBankProfitCertificateReviewFields,
+  getBankProfitCertificateReviewErrors,
+  readApprovedBankProfitCertificate,
+  recoverBankProfitCertificatePrintedAmounts,
+} from "@/lib/tax/bank-profit-certificate-fields";
+import { invalidateFilingForDocumentChange } from "@/lib/tax/document-invalidation";
+import {
+  bankProfitCertificateSubcategory,
+  baseFilingDocumentType,
+  isBankProfitCertificate,
+} from "@/lib/tax/bank-profit-document-slot";
+import { bankProfitSubcategoryFromCertificate } from "@/lib/tax/iris-bank-profit-capture";
+import {
   businessDetailsMatchBooks,
   withBusinessBooksValues,
 } from "@/lib/tax/business-books-figures";
@@ -90,6 +103,7 @@ import {
 
 /** Adds the visible blank placeholders a document type must have for review. */
 function ensureReviewFields(documentType: string, extracted: unknown): unknown {
+  documentType = baseFilingDocumentType(documentType);
   let review = extracted;
   if (documentType === "pension_statement")
     review = ensurePensionStatementReviewFields(extracted);
@@ -97,6 +111,8 @@ function ensureReviewFields(documentType: string, extracted: unknown): unknown {
     review = ensureSalaryCertificateReviewFields(extracted);
   if (documentType === "bank_statement")
     review = ensureBankStatementReviewFields(extracted);
+  if (documentType === "bank_certificate")
+    review = ensureBankProfitCertificateReviewFields(review);
   if (documentType === "business_balance_sheet")
     review = ensureBusinessBalanceReviewFields(extracted);
   if (documentType === "business_books")
@@ -140,6 +156,7 @@ For a bank statement, always return separate fields labelled exactly "Bank Name"
 For a CNIC, always return separate fields labelled exactly "CNIC Number", "Name", "Father Name", "Date of Birth" and "Expiry Date", plus "Address" when the card prints one. Return "Date of Birth" and "Expiry Date" as ISO YYYY-MM-DD. Read the date of birth from the "Date of Birth" line only: never use the issue date or the expiry date for it, and never guess a date of birth that is not printed on the card. For "Expiry Date" return the card's own validity/expiry line ("Valid Upto", "Expiry", "Date of Expiry"), or null when the card prints none — never infer one from the issue date.
 For a business balance sheet, use these exact separate field labels: ${Object.values(BUSINESS_BALANCE_LABELS).join(", ")}. Use PKR closing balances only when printed. Balance Sheet Date must be YYYY-MM-DD; do not infer Tax Year, currency, business identity, zero amounts, totals, or missing categories. Keep unknown values null. Never classify business bank balance as business cash. Never combine total assets with individual asset amounts. For other details preserve additional optional fields and notes.
 For a pension statement, extract printed facts only: annual gross pension, annual medical allowance, annual net pension payable, actual annual pension tax deducted, Tax Year, Date of Birth and Pensioner CNIC as separate facts. Use exact labels "Gross Pension (Annual PKR)", "Medical Allowance (Annual PKR)", "Net Pension Payable (Annual PKR)", "Pension Tax Deducted (Annual PKR)", "Tax Year", "Date of Birth" and "Pensioner CNIC". Preserve other printed details as optional fields, including monthly pension, pensioner name, PPO number and reporting period. Use printed PKR amounts only; never convert foreign currency. If another currency is printed, preserve a separate Currency field and leave PKR amounts null for review. Never confuse monthly and annual columns, gross and net, or deductions with tax chargeable. Never annualize a monthly number when no annual total is printed. Return each canonical annual fact once; repeated identical totals are not separate fields. If printed totals conflict, return null and describe the conflict for human review rather than picking an amount. Never infer missing tax deducted as zero: return null with confidence 0 when it is not stated. Do not request, generate or add "Approved Pension Amount for Tax (Annual PKR)", "Pension Withholding Already in Tax Ledger (Annual PKR)" or "Pension Tax Base Review Note" as normal statement fields: they are conditional HUMAN/app decisions, not required PDF facts. For backward compatibility only, if the original file explicitly prints one of those separately labelled review values, it may be copied as unapproved suggestions with an extra string property "sourceEvidence" containing the exact printed label and exact printed value, including the entire printed review-note paragraph. Never infer, calculate or invent the approved tax base, allowance treatment, ledger overlap or review note from gross/net amounts or bank receipts. If no exact labelled review value is printed, omit that reviewer field; if it is unclear or conflicting, return null with confidence 0 and no sourceEvidence. An explicit printed 0 may be copied; missing is never 0. Quoted text does not verify any real TAX_PAYMENT ledger or prove human approval. Do not treat medical allowance as automatically taxable or exempt. Return printed dates as ISO YYYY-MM-DD; never overwrite the taxpayer profile from this document.
+For a bank profit certificate, always return separate fields labelled exactly "Tax Year", "Reporting Period Start", "Reporting Period End", "Bank / Financial Institution Name", "Bank NTN", "Taxpayer Name", "Taxpayer CNIC", "Taxpayer NTN", "Account Number", "IBAN", "Instrument / Category", "Printed Section / Subsection", "Gross Annual Profit / Yield", "Tax Deducted / Withheld", "Bank-applied Withholding Rate (%)", "ATL / Non-ATL Status", "Net Profit Credited", "Currency", "Sukuk Holder Type (Company / Individual / AOP)" and "Sukuk Return Band (Above / Below PKR 1M)". Read each value only when printed on this certificate; when absent or unreadable return null, never guess or replace it with zero. Keep gross annual profit, tax deducted and net credited as three separate printed amounts; do not calculate one from the others. Return the bank-applied withholding rate and ATL/Non-ATL status exactly as printed; do not convert a printed rate into a rate-card choice or infer status. Copy the printed Section/subsection wording exactly; do not map it to a tax rule. Keep bank NTN separate from taxpayer NTN, and account number separate from IBAN; never construct an identifier from another field. Return reporting dates as ISO YYYY-MM-DD and Tax Year only when stated. For Sukuk, copy holder type and return band only when printed; otherwise return null. When the certificate prints any percentage rate for the withholding (in the summary table or as a printed rate line, including one marked as a sample or illustrative rate), copy the printed number into "Bank-applied Withholding Rate (%)" as a plain number without the % sign; return null only when no rate is printed at all. A bank profit certificate is not a bank statement: return an empty "transactions" array even when the certificate prints a profit/withholding record row; those amounts belong in the fields above, never in transaction rows. Pay special attention to summary tables whose column headers wrap onto two lines (for example "Bank-applied Withholding / Rate (%)"): bind each printed value under "Gross Annual Profit / Yield", "Tax Deducted / Withheld", "Bank-applied Withholding Rate (%)", "ATL / Non-ATL Status" and "Net Profit Credited" in that column order. Preserve other tax-relevant details as additional fields, but never infer legal tax treatment, a taxpayer's filing status, or missing values. The human must verify/correct the fields and explicitly Save & Approve Map before they are approved.
 For a salary certificate, always return separate required fields labelled exactly "Gross Salary (Annual PKR)", "Tax Deducted u/s 149 (Annual PKR)", "Employer Name (as registered with FBR)" and "Tax Year". "Tax Year" is the four-digit tax year the certificate is for (for example 2026 for July 2025 to June 2026); when only the salary period is printed, the tax year is the year in which that period ends; return null when neither is printed. The employer name is the company's full legal name exactly as printed on the certificate letterhead or body (for example "ACME (PRIVATE) LIMITED"); return null when it is not printed. Return the employer NTN, when printed, as a separate optional field labelled "Employer NTN". Use annual amounts explicitly stated on the certificate. If a value is not stated or cannot be read, return null; never infer gross salary from net bank deposits and never assume missing tax withheld is zero. Also preserve other tax-relevant details as separate optional fields when printed, including employee name/ID, salary period, basic pay, allowances, bonuses, benefits/perquisites, exempt or taxable components, and net pay. Do not invent missing details, combine separate components, or annualize monthly amounts unless the certificate explicitly states the annual total.`;
 
 type DocumentSlotRule = {
@@ -183,8 +200,14 @@ const DOCUMENT_SLOT_RULES: Record<string, DocumentSlotRule> = {
       "profit certificate",
       "profit statement",
     ],
-    fieldSignals: ["bank profit", "profit", "profit rate", "tax deducted"],
-    minimumSignals: 2,
+    fieldSignals: [
+      "gross annual profit",
+      "tax deducted / withheld",
+      "printed section / subsection",
+      "withholding rate",
+      "net profit credited",
+    ],
+    minimumSignals: 3,
   },
   pension_statement: {
     label: "pension statement",
@@ -284,6 +307,7 @@ function normalizeDocumentText(value: unknown) {
 }
 
 function buildExtractionPrompt(documentType: string) {
+  documentType = baseFilingDocumentType(documentType);
   const withholdingInstruction = ["bank_statement", "other_income_proof", "advance_tax_evidence", "pseb_certificate"].includes(documentType)
     ? `If this source explicitly contains Services withholding certificate/statement lines, preserve every line in fields using canonical labels "Invoice Number", "Payout Reference", "Withholding Tax (PKR)", "Withholding Section", "Withholding IRIS Code", and "Withholding Evidence Reference" with the SAME numeric row suffix. The evidence reference should identify the printed certificate/page/line. Also preserve printed Payer Name and Income Amount. Extract only facts explicitly printed in this source; missing section, code, amount, invoice/payout reference or certificate reference stays null. A net bank credit, gross-minus-net difference, selected Services category, ATL status or a rate does NOT prove withholding or an IRIS code. Never invent a certificate, copy withholding facts from a separate invoice, or assign tax treatment. Ordinary bank statement lines without explicit withholding facts must not create withholding fields.`
     : "";
@@ -310,6 +334,7 @@ Verify the actual document content against this slot. Do not label a bank statem
 }
 
 function validateExtractedDocument(documentType: string, extracted: unknown) {
+  documentType = baseFilingDocumentType(documentType);
   const rule = DOCUMENT_SLOT_RULES[documentType];
   if (!rule) return { valid: true as const };
 
@@ -602,7 +627,7 @@ export async function getFilingDocumentsAction(draftId: string) {
       documents: documents.map(({ extractedData, ...document }) => ({
         ...document,
         reviewRequiredErrors: storedDocumentReviewRequiredErrors(
-          document.documentType,
+          baseFilingDocumentType(document.documentType),
           extractedData,
           draft.taxYear,
         ),
@@ -704,7 +729,7 @@ export async function updateDocumentExtractionAction(
       document.documentType === "pension_statement"
         ? []
         : getDocumentReviewRequiredErrors(
-            document.documentType,
+            baseFilingDocumentType(document.documentType),
             fields,
             reviewDraft?.taxYear,
           );
@@ -721,8 +746,23 @@ export async function updateDocumentExtractionAction(
 
     const businessBankDraft = document.documentType === "bank_statement" && document.filingDraftId ? await prisma.filingDraft.findFirst({where:{id:document.filingDraftId,userId:document.userId},select:{taxYear:true,filerType:true,incomeSources:true}}) : null;
     const declaredPayload = document.extractionProvider === "USER_DECLARED" ? {...(normalizedPayload as Record<string,unknown>),sourceMode:"USER_DECLARED",notes:["Manual declaration; no original source uploaded."]} : normalizedPayload;
+
+    let payloadForStorage = declaredPayload;
+    if (
+      isBankProfitCertificate(document.documentType) &&
+      payloadForStorage &&
+      typeof payloadForStorage === "object" &&
+      !Array.isArray(payloadForStorage)
+    ) {
+      // A corrected payload is no longer the previously approved snapshot.
+      // The map action will write a fresh typed projection after re-approval.
+      const payload = { ...(payloadForStorage as Record<string, unknown>) };
+      delete payload.approvedBankProfitCertificate;
+      payloadForStorage = payload;
+    }
+
     const data = {
-      extractedData: JSON.stringify(declaredPayload),
+      extractedData: JSON.stringify(payloadForStorage),
       extractionStatus: "COMPLETED",
       extractionStartedAt: null,
       extractionError: null,
@@ -732,6 +772,18 @@ export async function updateDocumentExtractionAction(
       await prisma.$transaction(async (tx) => {
         await tx.document.update({ where: { id: documentId }, data });
         await invalidatePensionCalculation(tx, document.filingDraftId!, document.userId);
+      });
+    } else if (
+      isBankProfitCertificate(document.documentType) &&
+      document.filingDraftId
+    ) {
+      await prisma.$transaction(async (tx) => {
+        await tx.document.update({ where: { id: documentId }, data });
+        await invalidateFilingForDocumentChange(
+          tx,
+          document.filingDraftId!,
+          document.userId,
+        );
       });
     } else if (document.documentType === "invoice_summary" && document.filingDraftId) {
       await prisma.$transaction(async (tx) => {
@@ -1152,9 +1204,10 @@ export async function approveAndMapExtractedDocumentAction(documentId: string) {
       [
         "cnic",
         "bank_statement",
+        "bank_certificate",
         "business_balance_sheet",
         "business_books",
-      ].includes(document.documentType)
+      ].includes(baseFilingDocumentType(document.documentType))
     ) {
       const reviewDraft = await prisma.filingDraft.findFirst({
         where: { id: document.filingDraftId, userId: document.userId },
@@ -1163,7 +1216,7 @@ export async function approveAndMapExtractedDocumentAction(documentId: string) {
       if (!reviewDraft)
         return { success: false, error: "Filing draft not found" };
       const requiredErrors = getDocumentReviewRequiredErrors(
-        document.documentType,
+        baseFilingDocumentType(document.documentType),
         fields,
         reviewDraft.taxYear,
       );
@@ -1429,6 +1482,120 @@ export async function approveAndMapExtractedDocumentAction(documentId: string) {
         statementId: statement.id,
         transactionCount: extractedTransactions.length,
       };
+    }
+
+    if (isBankProfitCertificate(document.documentType)) {
+      if (!document.filingDraftId) {
+        return { success: false, error: "Document is not attached to a filing" };
+      }
+      try {
+        const certificate = await prisma.$transaction(
+          async (tx) => {
+            const latest = await tx.document.findFirst({
+              where: {
+                filingDraftId: document.filingDraftId,
+                userId: document.userId,
+                documentType: document.documentType,
+              },
+              orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+            });
+            if (
+              !latest ||
+              latest.id !== document.id ||
+              latest.extractedData !== document.extractedData
+            ) {
+              throw new Error(
+                "Bank profit certificate changed. Reload and review the latest certificate before approval.",
+              );
+            }
+            if (!["COMPLETED", "MAPPED"].includes(latest.extractionStatus)) {
+              throw new Error(
+                "Extract and review the bank profit certificate before approval.",
+              );
+            }
+            const draft = await tx.filingDraft.findFirst({
+              where: { id: document.filingDraftId!, userId: document.userId },
+              select: { taxYear: true },
+            });
+            if (!draft) throw new Error("Filing draft not found");
+
+            let savedPayload: unknown;
+            try {
+              savedPayload = latest.extractedData
+                ? JSON.parse(latest.extractedData)
+                : null;
+            } catch {
+              throw new Error(
+                "Saved extraction is unreadable. Re-extract or replace this certificate.",
+              );
+            }
+            const reviewedPayload = ensureBankProfitCertificateReviewFields(
+              savedPayload,
+            ) as {
+              fields?: Array<{ label?: unknown; value?: unknown }>;
+              [key: string]: unknown;
+            };
+            const reviewedFields = reviewedPayload?.fields ?? [];
+            const errors = getBankProfitCertificateReviewErrors(
+              reviewedFields,
+              draft.taxYear,
+            );
+            if (errors.length) throw new Error(errors.join(" "));
+
+            const canonical = readApprovedBankProfitCertificate(
+              reviewedFields,
+              draft.taxYear,
+            );
+            if (!canonical) {
+              throw new Error(
+                "The certificate could not be converted to the canonical bank-profit fields. Review every required value.",
+              );
+            }
+            const slotSubcategory = bankProfitCertificateSubcategory(document.documentType);
+            const certificateSubcategory = bankProfitSubcategoryFromCertificate(canonical);
+            if (slotSubcategory && certificateSubcategory !== slotSubcategory) {
+              throw new Error(
+                `This certificate belongs to ${certificateSubcategory || "an unsupported category"}, not the selected ${slotSubcategory} slot.`,
+              );
+            }
+
+            const payloadToStore = { ...reviewedPayload };
+            delete payloadToStore.approvedBankProfitCertificate;
+            await tx.document.update({
+              where: { id: latest.id },
+              data: {
+                extractedData: JSON.stringify({
+                  ...payloadToStore,
+                  approvedBankProfitCertificate: canonical,
+                }),
+                extractionStatus: "MAPPED",
+                extractionStartedAt: null,
+                extractionError: null,
+              },
+            });
+            await invalidateFilingForDocumentChange(
+              tx,
+              document.filingDraftId!,
+              document.userId,
+            );
+            return canonical;
+          },
+          { isolationLevel: "Serializable" },
+        );
+        return {
+          success: true,
+          mapping: "BANK_PROFIT_CERTIFICATE",
+          certificate,
+        };
+      } catch (error) {
+        return {
+          success: false,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Review the bank profit certificate before approval.",
+        };
+      }
     }
 
     if (document.documentType === "cnic") {
@@ -2581,13 +2748,23 @@ export async function extractDocumentWithGeminiAction(documentId: string) {
       document.documentType === "pension_statement"
         ? ensurePensionStatementReviewFields(normalizedExtraction, true)
         : ensureReviewFields(document.documentType, normalizedExtraction);
+    // Bank profit certificates: when the model left a printed summary amount
+    // unbound (e.g. the Sukuk-company summary layout landed the amounts only
+    // in notes, observed 2026-10-30), recover it from the certificate's own
+    // printed arithmetic line. Runs ONLY on this initial extraction path —
+    // never on the human's Save & Approve Map payload, where a deliberately
+    // blanked field must stay blank.
+    const recoveredExtraction =
+      baseFilingDocumentType(document.documentType) === "bank_certificate"
+        ? recoverBankProfitCertificatePrintedAmounts(reviewExtraction)
+        : reviewExtraction;
     const storageExtraction = normalizeBusinessListFieldsForStorage(
-      reviewExtraction,
+      recoveredExtraction,
     );
     // Valid detail lists are stored canonically. An unreadable list is kept
     // for the review screen's row editor instead of being silently dropped.
     const extracted = storageExtraction.errors.length
-      ? reviewExtraction
+      ? recoveredExtraction
       : storageExtraction.payload;
 
     if (!validation.valid) {

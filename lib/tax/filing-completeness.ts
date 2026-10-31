@@ -14,6 +14,7 @@ import {
   findLikelyInternalTransferPairs,
   findTransferLookalikePairs,
 } from "@/lib/tax/bank-transfer-matching";
+import { baseFilingDocumentType } from "@/lib/tax/bank-profit-document-slot";
 import { getRequiredTaxDocumentTypesForCurrentFlow } from "@/lib/tax/document-requirements";
 import {
   classifyTransaction,
@@ -42,6 +43,7 @@ const DOCUMENT_TYPES_REQUIRING_MAPPING = new Set([
   // Required for business income (16-Oct); its reviewed figures enter FBR.
   "business_balance_sheet",
   "bank_statement",
+  "bank_certificate",
   "salary_certificate",
   "pension_statement",
   // An extracted invoice summary only becomes Services income evidence once it
@@ -181,7 +183,8 @@ export async function validateFilingCompleteness(
     if (documentType === "bank_statement") continue;
 
     const latestDocument = documents.find(
-      (document) => document.documentType === documentType,
+      (document) =>
+        baseFilingDocumentType(document.documentType) === documentType,
     );
     if (!latestDocument) {
       blockers.push(`Upload the required ${documentType} document`);
@@ -191,6 +194,15 @@ export async function validateFilingCompleteness(
     if (documentType === "pension_statement") {
       for (const error of storedDocumentReviewRequiredErrors(documentType, latestDocument.extractedData, draft.taxYear)) {
         blockers.push(`Pension Statement: ${error}`);
+      }
+    }
+    if (documentType === "bank_certificate") {
+      for (const error of storedDocumentReviewRequiredErrors(
+        documentType,
+        latestDocument.extractedData,
+        draft.taxYear,
+      )) {
+        blockers.push(`Bank Profit Certificate: ${error}`);
       }
     }
     if (documentType === "business_books") {

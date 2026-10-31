@@ -197,6 +197,7 @@ function loadExtractionPrompt() {
     .find((node) => node.name.getText(ast) === "DOCUMENT_SLOT_RULES");
   assert.ok(fn && rules?.initializer, "load the actual prompt and slot rules, not a duplicate implementation");
   const isolated = `const EXTRACTION_PROMPT = "Common extraction policy"; const BUSINESS_SCHEDULE_LABELS = {}; const BUSINESS_EVIDENCE_PROMPT = "";
+    const baseFilingDocumentType = (documentType) => documentType.startsWith("bank_certificate:") ? "bank_certificate" : documentType;
     const DOCUMENT_SLOT_RULES = ${rules.initializer.getText(ast)}; ${fn.getText(ast)}; module.exports = buildExtractionPrompt;`;
   const compiled = ts.transpileModule(isolated, { compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS } }).outputText;
   const output = { exports: {} };

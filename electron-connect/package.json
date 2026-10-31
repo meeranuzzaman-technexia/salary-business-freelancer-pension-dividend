@@ -42,6 +42,7 @@
       "iris-business-contract.json",
       "iris-services-contract.json",
       "iris-business-row-driver.js",
+      "iris-bank-profit-row-driver.js",
       "iris-tour-census.js",
       "iris-save-draft.js",
       "iris-depreciation-driver.js",

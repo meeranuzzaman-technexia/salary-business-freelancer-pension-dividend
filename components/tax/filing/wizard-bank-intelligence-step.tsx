@@ -1,4 +1,6 @@
 "use client";
+import { isPlaceholderIncomeCategory } from "@/lib/tax/bank-classification-rules";
+import { isGiftCategory } from "@/lib/tax/gift-income";
 import { hasOwnerCapitalMovementDescription } from "@/lib/tax/business-bank-categories";
 
 import { useEffect, useRef, useState } from "react";
@@ -1013,7 +1015,10 @@ export function WizardBankIntelligenceStep({
                 {isFullView ? "Exit Full View" : "Open Full View"}
               </Button>
               {selectedRows.some(
-                (row) => row.classificationStatus === "SUGGESTED",
+                (row) =>
+                  row.classificationStatus === "SUGGESTED" ||
+                  (row.classificationStatus === "POTENTIAL_INCOME" &&
+                    row.suggestedCategory === "BANK_PROFIT"),
               ) && (
                 <Button
                   type="button"
@@ -1190,9 +1195,18 @@ export function WizardBankIntelligenceStep({
                             variant="outline"
                             className="border-blue-200 bg-blue-50 text-blue-700"
                           >
+                            {/* AI classification tags the category (e.g.
+                                PENSION, BANK_PROFIT) but keeps the row potential,
+                                because income is always confirmed by the taxpayer.
+                                Surface the tag so the detection is visible. */}
                             {row.suggestedCategory === "SERVICES" && freelancerEnabled
                               ? "Potential freelancer income · Services"
                               : "Potential income"}
+                            {row.suggestedCategory &&
+                            !(row.suggestedCategory === "SERVICES" && freelancerEnabled) &&
+                            !isPlaceholderIncomeCategory(row.suggestedCategory)
+                              ? ` · ${formatBankCategory(row.suggestedCategory, freelancerEnabled)}`
+                              : ""}
                           </Badge>
                         ) : row.classificationStatus === "POTENTIAL_ASSET" ? (
                           <Badge
@@ -1334,27 +1348,63 @@ export function WizardBankIntelligenceStep({
                                     title={
                                       row.classificationStatus ===
                                       "POTENTIAL_INCOME"
-                                        ? "Choose what this income is"
+                                        ? row.suggestedCategory &&
+                                          !isPlaceholderIncomeCategory(
+                                            row.suggestedCategory,
+                                          ) &&
+                                          !isGiftCategory(row.suggestedCategory)
+                                          ? `Approve as ${formatBankCategory(row.suggestedCategory, freelancerEnabled)} (AI suggestion)`
+                                          : "Choose what this income is"
                                         : row.classificationStatus ===
                                             "POTENTIAL_ASSET"
                                           ? "Approve as asset"
                                           : "Approve as liability"
                                     }
-                                    onClick={(event) =>
-                                      row.classificationStatus ===
-                                      "POTENTIAL_INCOME"
-                                        ? // An unexplained credit is never
-                                          // approved as-is: the user says what it is.
-                                          openManualPanel(
-                                            row,
-                                            event.currentTarget,
-                                            {
-                                              entryType: "INCOME",
-                                              category: "",
-                                            },
+                                    onClick={(event) => {
+                                      if (
+                                        row.classificationStatus !==
+                                        "POTENTIAL_INCOME"
+                                      ) {
+                                        return handleReview(
+                                          row.id!,
+                                          "APPROVE",
+                                        );
+                                      }
+                                      // AI classification already says what
+                                      // this credit is (PENSION, BANK_PROFIT,
+                                      // ...) — one click confirms it. The
+                                      // server re-validates the placeholder,
+                                      // gift-donor and transfer fences, so
+                                      // this is a shortcut, not a bypass.
+                                      if (
+                                        row.suggestedCategory &&
+                                        !isPlaceholderIncomeCategory(
+                                          row.suggestedCategory,
+                                        ) &&
+                                        !isGiftCategory(row.suggestedCategory)
+                                      ) {
+                                        return handleReview(
+                                          row.id!,
+                                          "APPROVE",
+                                        );
+                                      }
+                                      // An unexplained credit is never
+                                      // approved as-is: the user says what
+                                      // it is. A gift opens the same panel
+                                      // because IRIS needs the donor's number.
+                                      return openManualPanel(
+                                        row,
+                                        event.currentTarget,
+                                        {
+                                          entryType: "INCOME",
+                                          category: isGiftCategory(
+                                            row.suggestedCategory,
                                           )
-                                        : handleReview(row.id!, "APPROVE")
-                                    }
+                                            ? "GIFT"
+                                            : "",
+                                        },
+                                      );
+                                    }}
                                     disabled={reviewingId === row.id}
                                     className="flex h-7 w-7 items-center justify-center rounded-md text-amanah transition-colors hover:bg-amanah hover:text-white"
                                   >

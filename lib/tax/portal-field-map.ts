@@ -1,3 +1,7 @@
+import {
+  BANK_PROFIT_FINAL_TAX_ROWS,
+  type BankProfitPortalSource,
+} from "./iris-bank-profit-capture";
 import { isBusinessBankCategory } from "./business-bank-categories";
 import { buildDividendFinalTaxPlan } from "./dividend-portal-map";
 import type { PensionSource } from "./pension-source";
@@ -50,6 +54,7 @@ export type PortalFieldMapEntry = {
     | "Amount Exempt from Tax / Subject to Fixed / Final Tax"
     | "Amount Subject to Normal Tax"
     | "Tax Collected / Deducted"
+    | "Tax Chargeable"
     | "Tax Deducted"
     | "Amount";
   isTaxField: boolean;
@@ -105,6 +110,9 @@ export type PortalFieldMapEntry = {
    */
   giftDonorId?: string;
   giftDescription?: string;
+  /** Bank Profit Final Tax create/detail modal values from the approved certificate (TR-BankProfit port). */
+  bankProfitInvestment?: string;
+  bankProfitContents?: string;
 };
 
 /**
@@ -271,6 +279,9 @@ export type PortalAutofillField = {
   /** See PortalFieldMapEntry.giftDonorId / giftDescription (7037 only). */
   giftDonorId?: string;
   giftDescription?: string;
+  /** See PortalFieldMapEntry.bankProfitInvestment/bankProfitContents (§151 final-tax rows). */
+  bankProfitInvestment?: string;
+  bankProfitContents?: string;
   ledgerEntryId?: string;
   taxCreditId?: string;
   incomeRecordId?: string;
@@ -315,6 +326,15 @@ function getPortalNavigationHints(entry: PortalFieldMapEntry) {
       topTab: "Data" as const,
       leftPanel: "Employment",
       leftSection: "Salary",
+    };
+  }
+
+  if (portalArea === "other sources") {
+    return {
+      topTab: "Data" as const,
+      leftPanel: "Other Sources",
+      leftSection:
+        section === "tax deductions" ? "Tax Deductions" : "Receipts/Deductions",
     };
   }
 
@@ -402,9 +422,9 @@ const COMPUTED_IRIS_CODES = new Set(
 /** Categories that carry no verified IRIS line-item code — gap, never a guess. */
 const GAP_ONLY_INCOME_CATEGORIES: Record<string, string> = {
   BANK_PROFIT:
-    "Final-tax route: belongs in Other Sources → 'Subject to Final Tax', which has no live capture yet.",
+    "A reviewed certificate is required for the Bank Profit route. The approved Section 151 category uses its exact Other Sources → Tax Deductions → Final Tax row; the 500312 Profit on Debt income row is computed/read-only.",
   PROFIT_ON_DEBT:
-    "Final-tax route: belongs in Other Sources → 'Subject to Final Tax', which has no live capture yet.",
+    "A reviewed certificate is required for the Section 151 route. The approved category uses its exact Other Sources → Tax Deductions → Final Tax row; the 500312 Profit on Debt income row is computed/read-only.",
   BUSINESS:
     "Business income is filed on the Business schedules (3xxx); which line carries the engine total is unconfirmed.",
   SERVICES:
@@ -499,6 +519,12 @@ function toPortalAutofillField(
     ...(entry.giftDonorId ? { giftDonorId: entry.giftDonorId } : {}),
     ...(entry.giftDescription
       ? { giftDescription: entry.giftDescription }
+      : {}),
+    ...(entry.bankProfitInvestment
+      ? { bankProfitInvestment: entry.bankProfitInvestment }
+      : {}),
+    ...(entry.bankProfitContents
+      ? { bankProfitContents: entry.bankProfitContents }
       : {}),
     ledgerEntryId: entry.ledgerEntryId,
     taxCreditId: entry.taxCreditId,
@@ -770,6 +796,9 @@ export function buildPortalFieldMap(params: {
     ownershipReviewRequired?: boolean;
   }[];
   pensionSource?: PensionSource;
+  /** Approved bank-profit certificate source (§151 Final Tax route). Legacy single kept for test back-compat. */
+  bankProfitSource?: BankProfitPortalSource;
+  bankProfitSources?: BankProfitPortalSource[];
   pensionDetails?: {
     totalPension: number;
     exemptLimit: number;
@@ -814,6 +843,8 @@ export function buildPortalFieldMap(params: {
     netCashMovement: cashMovement = null,
     pensionDetails,
     pensionSource,
+    bankProfitSource,
+    bankProfitSources = bankProfitSource ? [bankProfitSource] : [],
     dividendCertificates = [],
     dividendSubcategories = [],
   } = params;
@@ -965,6 +996,18 @@ export function buildPortalFieldMap(params: {
     const normalizedCat = isGiftCategory(entry.category)
       ? "GIFT"
       : normalizeCategory(entry.category);
+    // Bank Profit (§151) with an approved certificate is covered by the Final
+    // Tax rows pushed below; the bank credit must not double-count as a
+    // generic income line or a manual gap (TR-BankProfit port).
+    if (
+      bankProfitSources.length > 0 &&
+      entry.entryType === "INCOME" &&
+      ["BANK_PROFIT", "PROFIT_ON_DEBT"].includes(normalizedCat)
+    ) {
+      totalIncome += amount;
+      continue;
+    }
+
     // Bank pension receipts are cash/wealth evidence. An approved annual
     // pension source replaces them for income-sheet entry, exactly once.
     if (pensionSource && normalizedCat === "PENSION" && entry.entryType === "INCOME") continue;
@@ -1196,6 +1239,48 @@ export function buildPortalFieldMap(params: {
     }
   }
 
+  for (const bankProfitSource of bankProfitSources) {
+    // The reviewed bank-statement gross is the taxable base; the certificate
+    // supplies actual withholding and the saved calculation supplies tax due.
+    // Each approved §151 category is created through the verified Final Tax
+    // selector and Investment detail workflow, then exposes these three cells
+    // (TR-BankProfit port; detail-creation verified per BANK_PROFIT_FINAL_TAX_ROWS).
+    const target = BANK_PROFIT_FINAL_TAX_ROWS[bankProfitSource.subcategory];
+    if (!target.writableDetailCreationVerified) {
+      unmapped.set("BANK_PROFIT", {
+        category: "BANK_PROFIT",
+        entryIds: [],
+        totalAmount: bankProfitSource.statementGrossProfit,
+        reason: `${target.description} (${target.code}) appears only in the selection popup/read-only parent capture. Capture its stable post-selection writeable child row before automation.`,
+      });
+    } else {
+      for (const [column, amount] of [
+        ["Taxable Amount", bankProfitSource.statementGrossProfit],
+        ["Tax Deducted", bankProfitSource.taxDeducted],
+        ["Tax Chargeable", bankProfitSource.taxChargeable],
+      ] as const) {
+        taxAgg.set(`${target.code}:${column}`, {
+          entry: {
+            ourCategory: "BANK_PROFIT",
+            ourDescription: `Section 151 final-tax ${column.toLowerCase()}`,
+            ourAmount: amount,
+            irisCode: target.code,
+            irisDescription: target.description,
+            portalArea: "Other Sources",
+            section: "Tax Deductions",
+            column,
+            isTaxField: true,
+            filerStatus: taxpayerListStatus || undefined,
+            sourceEntryCount: 1,
+            bankProfitInvestment: bankProfitSource.investment,
+            bankProfitContents: bankProfitSource.contents,
+          },
+          ids: [bankProfitSource.documentId],
+        });
+      }
+    }
+  }
+
   // Tax Deductions → Adjustable Tax is the portal destination for Section 149.
   // The supplied Tax Deductions DOM proves code 64020004 and its editable
   // `Tax Deducted` cell (index 1). The salary certificate is uploaded/reviewed
@@ -1229,6 +1314,7 @@ export function buildPortalFieldMap(params: {
 
     // Try to map section to IRIS code
     const sectionUpper = credit.section.toUpperCase();
+    if (bankProfitSources.length > 0 && /^151(?:\b|\()/.test(sectionUpper)) continue;
     let irisCode =
       TAX_SECTION_TO_IRIS_CODE[credit.section] ||
       TAX_SECTION_TO_IRIS_CODE[sectionUpper];
@@ -1808,7 +1894,7 @@ export function buildPortalFieldMap(params: {
   return {
     // 1.1.0 — one field per IRIS cell (aggregated), entered-column targeting,
     // computed rows and unverified categories reported instead of guessed.
-    version: "1.1.0",
+    version: "1.3.0",
     generatedAt: new Date().toISOString(),
     taxYear,
     filerType,
@@ -1850,7 +1936,7 @@ export function buildPortalFieldMap(params: {
       pensionTreatment: pensionSource?.treatment,
     },
     selectorBundle: {
-      version: "v1.1-2026-09-09-iris2-capture",
+      version: "v1.3-2026-10-23-bank-profit-investment",
       portalType: "AUTO",
     },
   };

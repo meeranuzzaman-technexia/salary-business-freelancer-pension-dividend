@@ -55,6 +55,14 @@ import {
   extractMappedSalaryWithholding,
   normalizeLedgerCategory,
 } from "@/lib/tax/withholding-sources";
+import {
+  readApprovedBankProfitCertificate,
+  type ApprovedBankProfitCertificate,
+} from "@/lib/tax/bank-profit-certificate-fields";
+import {
+  bankProfitSubcategoryFromCertificate,
+  type BankProfitPortalSource,
+} from "@/lib/tax/iris-bank-profit-capture";
 
 async function getOwnedDraft(draftId: string) {
   const session = await getServerSession(authOptions);
@@ -396,6 +404,7 @@ export async function generateFilingPacketAction(
       latestPacket,
       taxCredits,
       salaryCertificate,
+      bankProfitCertificates,
       pensionSelections,
       businessSelections,
       businessBalanceSheet,
@@ -494,6 +503,16 @@ export async function generateFilingPacketAction(
           extractionStatus: "MAPPED",
         },
         select: { extractedData: true },
+      }),
+      prisma.document.findMany({
+        where: {
+          filingDraftId: draft.id,
+          userId: draft.userId,
+          documentType: { startsWith: "bank_certificate" },
+          extractionStatus: "MAPPED",
+        },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        select: { id: true, documentType: true, extractedData: true },
       }),
       prisma.filingIncomeSelection.findMany({
         where: {
@@ -806,6 +825,88 @@ export async function generateFilingPacketAction(
     const salaryCertificateGrossSalary = extractMappedSalaryGross(
       salaryCertificate?.extractedData ?? null,
     );
+    const bankProfitSources: BankProfitPortalSource[] = [];
+    if (parsedIncomeSources.includes("bank_profit")) {
+      if (bankProfitCertificates.length === 0) {
+        return {
+          success: false,
+          error:
+            "Map and approve the Bank Profit Certificate before generating the IRIS packet.",
+        };
+      }
+      const calculationLines = await prisma.filingTaxCalculationLine.findMany({
+        where: {
+          filingDraftId: draft.id,
+          userId: draft.userId,
+          calculationRevision: draftData.taxCalculationRevision,
+          source: "bank_profit",
+        },
+        select: {
+          subcategory: true,
+          taxBase: true,
+          calculatedTax: true,
+        },
+      });
+      if (calculationLines.length === 0) {
+        return {
+          success: false,
+          error:
+            "The current calculation must contain Bank Profit lines before IRIS mapping. Recalculate Tax.",
+        };
+      }
+      const currentLedgerGrossProfit = toMoneyNumber(
+        sumMoney(
+          ledgerEntries
+            .filter(
+              (entry) =>
+                entry.entryType === "INCOME" &&
+                ["BANK_PROFIT", "PROFIT_ON_DEBT"].includes(
+                  normalizeLedgerCategory(entry.category),
+                ),
+            )
+            .map((entry) => entry.amount),
+        ),
+      );
+      const calculatedGrossProfit = toMoneyNumber(sumMoney(calculationLines.map((line) => line.taxBase)));
+      if (currentLedgerGrossProfit !== calculatedGrossProfit) {
+        return {
+          success: false,
+          error:
+            "Bank-statement profit changed after the saved calculation. Recalculate Tax before generating the IRIS packet.",
+        };
+      }
+      const lineByCategory = new Map(calculationLines.map((line) => [line.subcategory, line]));
+      for (const certificate of bankProfitCertificates) {
+        let payload: { fields?: Array<{ label?: unknown; value?: unknown }>; approvedBankProfitCertificate?: ApprovedBankProfitCertificate };
+        try { payload = JSON.parse(certificate.extractedData || "{}"); }
+        catch { return { success: false, error: "An approved Bank Profit Certificate is unreadable. Re-map it before filing." }; }
+        const approved = readApprovedBankProfitCertificate(payload.fields, draftData.taxYear);
+        const subcategory = approved && bankProfitSubcategoryFromCertificate(approved);
+        if (!approved || !payload.approvedBankProfitCertificate || !subcategory)
+          return { success: false, error: "An approved Bank Profit Certificate is incomplete or does not identify a supported Section 151 category." };
+        if (calculationLines.length > 1 && certificate.documentType !== `bank_certificate:${subcategory}`) continue;
+        const line = lineByCategory.get(subcategory);
+        if (!line || bankProfitSources.some((source) => source.subcategory === subcategory))
+          return { success: false, error: `Provide exactly one approved Bank Profit Certificate for ${subcategory}, matching the current calculation.` };
+        const gross = toMoneyNumber(line.taxBase);
+        if (gross !== approved.grossAnnualProfit)
+          return { success: false, error: `Calculated ${subcategory} profit (PKR ${gross.toLocaleString("en-PK")}) does not match its approved certificate gross (PKR ${approved.grossAnnualProfit.toLocaleString("en-PK")}).` };
+        const investment = approved.instrumentCategory.trim();
+        if (investment.length > 50)
+          return { success: false, error: "A Bank Profit instrument/category is longer than the 50 characters accepted by IRIS." };
+        bankProfitSources.push({
+          documentId: certificate.id,
+          subcategory,
+          investment,
+          contents: [`1. ${approved.iban || approved.accountNumber}`, `2. ${investment}`, `3. ${approved.bankName.trim()}`].join("\n"),
+          statementGrossProfit: gross,
+          taxDeducted: approved.taxDeducted,
+          taxChargeable: toMoneyNumber(line.calculatedTax),
+        });
+      }
+      if (bankProfitSources.length !== calculationLines.length)
+        return { success: false, error: "Upload and approve one Bank Profit Certificate for every selected Bank Profit category." };
+    }
 
     const bankAccountsForPacket = await prisma.bankAccount.findMany({
       where: { filingDraftId: draft.id, userId: draft.userId },
@@ -1083,6 +1184,7 @@ export async function generateFilingPacketAction(
         : 0,
       taxWithheld: draftData.taxWithheld ? Number(draftData.taxWithheld) : 0,
       pensionSource: pensionSource ?? undefined,
+      bankProfitSources,
       dividendCertificates,
       dividendSubcategories,
       salaryCertificateTaxWithheld,
